@@ -1,0 +1,27 @@
+# DreamerV4 Implementation - Dependencies
+# Core
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.24.0
+
+# Transformers and attention
+einops>=0.7.0
+
+# Perceptual loss
+lpips>=0.1.4
+
+# Configuration
+pyyaml>=6.0
+omegaconf>=2.3.0
+
+# Logging and visualization
+tensorboard>=2.14.0
+wandb>=0.15.0
+tqdm>=4.65.0
+
+# MineRL environment (optional - for data collection)
+# minerl>=0.4.4
+
+# Utilities
+pillow>=10.0.0
+matplotlib>=3.7.0

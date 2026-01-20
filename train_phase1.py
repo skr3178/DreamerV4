@@ -202,6 +202,7 @@ def train_phase1(config: Dict):
         image_size=(config["data"]["image_height"], config["data"]["image_width"]),
         num_workers=config["data"]["num_workers"],
         split="train",
+        max_episodes=config["data"].get("max_episodes", None),
     )
     
     # Create losses

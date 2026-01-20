@@ -31,6 +31,7 @@ class MineRLDataset(Dataset):
         frame_skip: int = 1,
         split: str = "train",
         transform: Optional[callable] = None,
+        max_episodes: Optional[int] = None,
     ):
         """
         Args:
@@ -40,6 +41,7 @@ class MineRLDataset(Dataset):
             frame_skip: Number of frames to skip between samples
             split: "train" or "val"
             transform: Optional transform to apply to images
+            max_episodes: Maximum number of episodes to load (None = all)
         """
         self.data_path = Path(data_path)
         self.sequence_length = sequence_length
@@ -47,6 +49,7 @@ class MineRLDataset(Dataset):
         self.frame_skip = frame_skip
         self.split = split
         self.transform = transform
+        self.max_episodes = max_episodes
         
         # Load episode metadata
         self.episodes = self._load_episodes()
@@ -128,6 +131,11 @@ class MineRLDataset(Dataset):
                         "length": len(frames),
                     })
         
+        # Limit number of episodes if specified
+        if self.max_episodes is not None and len(episodes) > self.max_episodes:
+            print(f"Limiting to {self.max_episodes} episodes (found {len(episodes)})")
+            episodes = episodes[:self.max_episodes]
+        
         print(f"Loaded {len(episodes)} episodes from {len(episode_dirs_set)} directories")
         return episodes
     
@@ -153,24 +161,28 @@ class MineRLDataset(Dataset):
             data = episode["data"]
             
             if hasattr(data, "__getitem__"):
-                item = data[frame_idx]
-                
-                if isinstance(item, dict):
-                    # TensorDict format
-                    if "obs" in item:
-                        obs = item["obs"]
-                        if obs.dim() == 1:
-                            # State observation, need to handle differently
+                # Check bounds
+                if frame_idx < len(data):
+                    item = data[frame_idx]
+                    
+                    if isinstance(item, dict):
+                        # TensorDict format
+                        if "obs" in item:
+                            obs = item["obs"]
+                            if obs.dim() == 1:
+                                # State observation, need to handle differently
+                                return obs
                             return obs
-                        return obs
-                    elif "image" in item:
-                        return item["image"]
-                
-                return item
+                        elif "image" in item:
+                            return item["image"]
+                    
+                    return item
         
         elif "frames_npy" in episode:
             # Load from frames.npy file
             frames_array = np.load(episode["frames_npy"])
+            # Clamp frame_idx to frames array bounds
+            frame_idx = min(frame_idx, len(frames_array) - 1) if len(frames_array) > 0 else 0
             frame = frames_array[frame_idx]  # (H, W, C) uint8
             
             # Convert to tensor and normalize
@@ -189,7 +201,10 @@ class MineRLDataset(Dataset):
             from PIL import Image
             import torchvision.transforms.functional as TF
             
-            frame_path = episode["frames"][frame_idx]
+            # Clamp frame_idx to frames list bounds
+            frames_list = episode["frames"]
+            frame_idx = min(frame_idx, len(frames_list) - 1) if len(frames_list) > 0 else 0
+            frame_path = frames_list[frame_idx]
             image = Image.open(frame_path).convert("RGB")
             image = TF.resize(image, self.image_size)
             image = TF.to_tensor(image)
@@ -202,25 +217,43 @@ class MineRLDataset(Dataset):
         if "data" in episode:
             data = episode["data"]
             if hasattr(data, "__getitem__"):
-                item = data[frame_idx]
-                if isinstance(item, dict) and "action" in item:
-                    return item["action"]
+                # Check bounds
+                if frame_idx < len(data):
+                    item = data[frame_idx]
+                    if isinstance(item, dict) and "action" in item:
+                        return item["action"]
         
         # Load from actions.npz file
         if "actions" in episode:
             if isinstance(episode["actions"], Path):
                 # Path to actions.npz file
                 actions_dict = np.load(episode["actions"])
+                
                 # Combine all action components into single discrete action
-                # For now, use the first action component (forward) as placeholder
-                # TODO: Properly combine binary + camera + discrete actions
-                if len(actions_dict.keys()) > 0:
-                    first_key = list(actions_dict.keys())[0]
-                    action_val = actions_dict[first_key][frame_idx]
+                from .action_utils import mineRL_actions_to_categorical
+                
+                try:
+                    # Convert to categorical action space
+                    categorical_actions = mineRL_actions_to_categorical(actions_dict)
+                    # Clamp frame_idx to action array bounds
+                    frame_idx = min(frame_idx, len(categorical_actions) - 1) if len(categorical_actions) > 0 else 0
+                    action_val = categorical_actions[frame_idx]
                     return torch.tensor(action_val, dtype=torch.long)
+                except Exception as e:
+                    # Fallback: use first action component if combination fails
+                    print(f"Warning: Could not combine actions, using fallback: {e}")
+                    if len(actions_dict.keys()) > 0:
+                        first_key = list(actions_dict.keys())[0]
+                        action_array = actions_dict[first_key]
+                        frame_idx = min(frame_idx, len(action_array) - 1) if len(action_array) > 0 else 0
+                        action_val = action_array[frame_idx]
+                        return torch.tensor(action_val, dtype=torch.long)
             elif episode["actions"] is not None:
                 # Already loaded numpy array
-                return torch.from_numpy(episode["actions"][frame_idx])
+                actions = episode["actions"]
+                # Clamp frame_idx to actions array bounds
+                frame_idx = min(frame_idx, len(actions) - 1) if len(actions) > 0 else 0
+                return torch.from_numpy(actions[frame_idx])
         
         # Default action (no-op)
         return torch.zeros(1, dtype=torch.long)
@@ -230,19 +263,26 @@ class MineRLDataset(Dataset):
         if "data" in episode:
             data = episode["data"]
             if hasattr(data, "__getitem__"):
-                item = data[frame_idx]
-                if isinstance(item, dict) and "reward" in item:
-                    return item["reward"]
+                # Check bounds
+                if frame_idx < len(data):
+                    item = data[frame_idx]
+                    if isinstance(item, dict) and "reward" in item:
+                        return item["reward"]
         
         # Load from rewards.npy file
         if "rewards" in episode:
             if isinstance(episode["rewards"], Path):
                 # Path to rewards.npy file
                 rewards = np.load(episode["rewards"])
+                # Clamp frame_idx to rewards array bounds
+                frame_idx = min(frame_idx, len(rewards) - 1) if len(rewards) > 0 else 0
                 return torch.tensor(rewards[frame_idx], dtype=torch.float32)
             elif episode["rewards"] is not None:
                 # Already loaded numpy array
-                return torch.tensor(episode["rewards"][frame_idx], dtype=torch.float32)
+                rewards = episode["rewards"]
+                # Clamp frame_idx to rewards array bounds
+                frame_idx = min(frame_idx, len(rewards) - 1) if len(rewards) > 0 else 0
+                return torch.tensor(rewards[frame_idx], dtype=torch.float32)
         
         return torch.tensor(0.0)
     

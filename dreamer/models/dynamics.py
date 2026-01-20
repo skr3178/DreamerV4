@@ -58,6 +58,8 @@ class DynamicsModel(nn.Module):
         num_registers: int = 4,
         # Shortcut forcing
         max_shortcut_steps: int = 6,  # K in paper (log2 of max steps)
+        # Context corruption (Section 4.2)
+        context_noise_level: float = 0.1,  # τ_ctx for context frames
     ):
         """
         Args:
@@ -72,11 +74,13 @@ class DynamicsModel(nn.Module):
             continuous_action_dim: Continuous action dimension (if continuous)
             num_registers: Number of register tokens
             max_shortcut_steps: Maximum log2 of shortcut steps (K)
+            context_noise_level: Fixed noise level for context frames (τ_ctx, default 0.1)
         """
         super().__init__()
-        
+
         self.latent_dim = latent_dim
         self.num_latent_tokens = num_latent_tokens
+        self.context_noise_level = context_noise_level
         self.embed_dim = embed_dim
         self.num_registers = num_registers
         self.max_shortcut_steps = max_shortcut_steps
@@ -104,6 +108,14 @@ class DynamicsModel(nn.Module):
         # Learnable position embeddings for latent tokens within a timestep
         self.latent_pos_embed = nn.Parameter(
             torch.randn(1, num_latent_tokens, embed_dim) * 0.02
+        )
+        
+        # Learnable position embeddings per frame (Section 3.1)
+        # These distinguish different timesteps in the sequence
+        # We use a large max_seq_len to handle variable-length sequences
+        max_seq_len = 1024  # Maximum sequence length for position embeddings
+        self.frame_pos_embed = nn.Parameter(
+            torch.randn(1, max_seq_len, embed_dim) * 0.02
         )
         
         # Unified block-causal transformer (same architecture as tokenizer)
@@ -139,23 +151,65 @@ class DynamicsModel(nn.Module):
     ) -> torch.Tensor:
         """
         Add noise to latents based on signal level τ.
-        
+
         Interpolation: z̃ = (1 - τ) * noise + τ * z
-        
+
         Args:
             latents: Clean latents (batch, ..., latent_dim)
             signal_level: τ values in [0, 1] (batch,)
-        
+
         Returns:
             Noisy latents
         """
         noise = torch.randn_like(latents)
-        
+
         # Expand signal_level for broadcasting
         while signal_level.dim() < latents.dim():
             signal_level = signal_level.unsqueeze(-1)
-        
+
         noisy_latents = (1 - signal_level) * noise + signal_level * latents
+        return noisy_latents
+
+    def add_noise_with_context_corruption(
+        self,
+        latents: torch.Tensor,
+        signal_level: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Add noise with context corruption per Section 4.2.
+
+        Context frames (all but last) get fixed noise at τ_ctx.
+        Target frame (last) gets noise at sampled τ.
+
+        This makes the model robust to its own prediction errors during
+        autoregressive generation, since context comes from model predictions.
+
+        Args:
+            latents: Clean latents (batch, time, num_latent, latent_dim)
+            signal_level: τ values for target frame (batch,)
+
+        Returns:
+            Noisy latents with context corruption
+        """
+        batch_size, time_steps, num_latent, latent_dim = latents.shape
+        device = latents.device
+
+        # Generate noise for all frames
+        noise = torch.randn_like(latents)
+
+        # Build per-timestep signal levels: τ_ctx for context, τ for target
+        # Shape: (batch, time, 1, 1) for broadcasting
+        tau_per_step = torch.full(
+            (batch_size, time_steps, 1, 1),
+            self.context_noise_level,
+            device=device,
+        )
+        # Last timestep uses the sampled signal_level
+        tau_per_step[:, -1, :, :] = signal_level.view(batch_size, 1, 1)
+
+        # Apply noise: z̃ = (1 - τ) * noise + τ * z
+        noisy_latents = (1 - tau_per_step) * noise + tau_per_step * latents
+
         return noisy_latents
     
     def sample_shortcut_params(
@@ -181,15 +235,22 @@ class DynamicsModel(nn.Module):
         """
         # Sample k uniformly from {0, 1, ..., K}
         k = torch.randint(0, self.max_shortcut_steps + 1, (batch_size,), device=device)
-        
+
         # Compute step sizes: d = 1 / 2^k
         step_size = 1.0 / (2.0 ** k.float())
-        
-        # Sample τ uniformly in [0, 1]
-        signal_level = torch.rand(batch_size, device=device)
-        
-        # Ensure τ + d <= 1
-        signal_level = signal_level * (1.0 - step_size)
+
+        # Sample τ from discrete grid per Equation 4: τ ~ U({0, 1/d, ..., 1 - 1/d})
+        # For step_size d, valid τ values are: 0, d, 2d, ..., (1-d)
+        # Number of valid grid points = 1/d = 2^k
+        num_grid_points = (2.0 ** k.float()).long()  # 2^k points per sample
+
+        # Sample random index from [0, num_grid_points) for each sample
+        # Using uniform sampling and floor since each sample may have different grid size
+        random_01 = torch.rand(batch_size, device=device)
+        grid_indices = torch.floor(random_01 * num_grid_points.float()).long()
+
+        # Compute τ = index * d (ensures τ is on the discrete grid)
+        signal_level = grid_indices.float() * step_size
         
         # Check if d is minimum (d_min = 1/2^K)
         d_min = 1.0 / (2.0 ** self.max_shortcut_steps)
@@ -250,17 +311,28 @@ class DynamicsModel(nn.Module):
         registers = self.register_tokens(batch_size)  # (batch, num_reg, embed_dim)
         registers = registers.unsqueeze(1).expand(-1, time_steps, -1, -1)  # (batch, time, num_reg, embed_dim)
         
-        # Build interleaved sequence
+        # Build interleaved sequence with frame-level position embeddings
         all_tokens = []
         for t in range(time_steps):
-            # Action token
-            all_tokens.append(action_embeds[:, t:t+1])  # (batch, 1, embed_dim)
-            # Signal token
-            all_tokens.append(signal_embeds[:, t:t+1])  # (batch, 1, embed_dim)
-            # Latent tokens
-            all_tokens.append(latent_embeds[:, t])  # (batch, num_latent, embed_dim)
-            # Register tokens
-            all_tokens.append(registers[:, t])  # (batch, num_reg, embed_dim)
+            # Get frame position embedding for this timestep
+            # Clamp to max_seq_len to handle long sequences
+            frame_pos = self.frame_pos_embed[:, t % self.frame_pos_embed.shape[1], :]  # (1, embed_dim)
+            
+            # Action token (add frame position embedding)
+            action_t = action_embeds[:, t:t+1] + frame_pos  # (batch, 1, embed_dim)
+            all_tokens.append(action_t)
+            
+            # Signal token (add frame position embedding)
+            signal_t = signal_embeds[:, t:t+1] + frame_pos  # (batch, 1, embed_dim)
+            all_tokens.append(signal_t)
+            
+            # Latent tokens (add frame position embedding to each latent token)
+            latent_t = latent_embeds[:, t] + frame_pos  # (batch, num_latent, embed_dim)
+            all_tokens.append(latent_t)
+            
+            # Register tokens (add frame position embedding to each register)
+            register_t = registers[:, t] + frame_pos  # (batch, num_reg, embed_dim)
+            all_tokens.append(register_t)
         
         tokens = torch.cat(all_tokens, dim=1)  # (batch, time * tokens_per_step, embed_dim)
         
@@ -310,10 +382,11 @@ class DynamicsModel(nn.Module):
         step_size: Optional[torch.Tensor] = None,
         discrete_actions: bool = True,
         add_noise_to_latents: bool = True,
+        use_context_corruption: bool = True,
     ) -> Dict[str, torch.Tensor]:
         """
         Forward pass for training with shortcut forcing.
-        
+
         Args:
             latents: Clean latent tokens (batch, time, num_latent, latent_dim)
             actions: Actions (batch, time) or (batch, time, action_dim)
@@ -321,7 +394,10 @@ class DynamicsModel(nn.Module):
             step_size: Optional d values (sampled if not provided)
             discrete_actions: Whether actions are discrete
             add_noise_to_latents: Whether to add noise based on signal level
-        
+            use_context_corruption: Whether to use context corruption (Section 4.2)
+                If True, context frames get τ_ctx noise, target frame gets τ noise.
+                If False, all frames get τ noise (original behavior).
+
         Returns:
             Dictionary containing:
                 - predicted_latents: Predicted clean latents
@@ -332,20 +408,25 @@ class DynamicsModel(nn.Module):
         """
         batch_size, time_steps = latents.shape[:2]
         device = latents.device
-        
+
         # Sample shortcut parameters if not provided
         if signal_level is None or step_size is None:
             signal_level, step_size, d_is_min = self.sample_shortcut_params(batch_size, device)
         else:
             d_min = 1.0 / (2.0 ** self.max_shortcut_steps)
             d_is_min = step_size <= d_min + 1e-6
-        
+
         # Store clean latents as targets
         target_latents = latents.clone()
-        
+
         # Add noise to latents based on signal level
         if add_noise_to_latents:
-            noisy_latents = self.add_noise(latents, signal_level)
+            if use_context_corruption and time_steps > 1:
+                # Context corruption: τ_ctx for context frames, τ for target frame
+                noisy_latents = self.add_noise_with_context_corruption(latents, signal_level)
+            else:
+                # Original behavior: same τ for all frames
+                noisy_latents = self.add_noise(latents, signal_level)
         else:
             noisy_latents = latents
         

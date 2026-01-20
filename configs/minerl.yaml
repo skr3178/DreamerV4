@@ -39,12 +39,20 @@ tokenizer:
 dynamics:
   # Inherits embed_dim, depth, num_heads from tokenizer
   max_shortcut_steps: 6  # K in paper (2^K = 64 max steps)
-  # MineRL action space (from inspection):
-  # - 8 binary keyboard: forward, left, back, right, jump, sneak, sprint, attack
+  # MineRL action space (verified from actual dataset):
+  # - 8 binary keyboard: forward, back, left, right, jump, sneak, sprint, attack
   # - Camera: continuous 2D (pitch, yaw) → discretize to 121 classes (11×11 bins)
-  # - Additional discrete: place, equip, craft, nearbyCraft, nearbySmelt (varies by env)
+  #   Range: [-89.40, 103.50] for pitch/yaw
+  # - 5 discrete string actions:
+  #   * craft: 5 values (crafting_table, planks, stick, torch, none)
+  #   * equip: 5 values (iron_pickaxe, stone_pickaxe, wooden_axe, wooden_pickaxe, none)
+  #   * nearbyCraft: 6 values (furnace, iron_pickaxe, stone_pickaxe, wooden_axe, wooden_pickaxe, none)
+  #   * nearbySmelt: 2 values (iron_ingot, none)
+  #   * place: 7 values (cobblestone, crafting_table, dirt, furnace, stone, torch, none)
+  # Total discrete combinations: 5×5×6×2×7 = 2,100 (but typically only ~15-20 are used in practice)
   # For DreamerV4: combine into single categorical space
-  num_discrete_actions: 144  # 8 binary + 121 camera + 15 additional = ~144 total
+  # Strategy: 8 binary (as 8 separate) + 121 camera + ~15 most common discrete combinations = ~144
+  num_discrete_actions: 144  # 8 binary + 121 camera + 15 discrete combinations
   # Alternative: use multi-discrete (8 binary + 121 categorical + others)
   action_space_type: "categorical"  # "categorical" or "multi_discrete"
   num_registers: 4
@@ -54,8 +62,12 @@ heads:
   hidden_dim: 256
   num_layers: 2
   num_bins: 255  # For distributional value/reward
-  # Action space for MineRL (from inspection)
-  num_actions: 144  # Total discrete actions (8 binary keyboard + 121 camera + 15 additional)
+  # Action space for MineRL (verified from actual dataset)
+  num_actions: 144  # Total discrete actions (8 binary keyboard + 121 camera + 15 discrete combinations)
+  # Breakdown:
+  # - 8 binary keyboard actions (forward, back, left, right, jump, sneak, sprint, attack)
+  # - 121 camera actions (11×11 discretization of pitch/yaw)
+  # - 15 discrete action combinations (from craft, equip, nearbyCraft, nearbySmelt, place)
   # If using multi-discrete:
   # keyboard_binary: 8  # 8 independent Bernoulli distributions
   # camera_discrete: 121  # 121-class categorical (11×11 bins for pitch×yaw)
@@ -82,6 +94,10 @@ training:
     reward_weight: 1.0
     freeze_transformer: true
     save_every: 5
+    # Focal loss for sparse MineRL rewards
+    use_focal_loss: true
+    focal_gamma: 2.0
+    focal_alpha: 0.25
 
   # Phase 3: Imagination Training with PMPO
   phase3:
@@ -93,14 +109,24 @@ training:
     num_denoising_steps: 4   # K - shortcut sampling steps
     
     # RL hyperparameters
-    discount: 0.997          # γ - high for long-horizon tasks
-    lambda: 0.95             # λ - TD(λ) trace decay
+    # For MineRL (sparse rewards, long horizons):
+    # - High discount (0.997) ensures rewards 1000+ steps away still contribute
+    # - Lambda (0.95) balances bias-variance tradeoff for TD(λ)
+    # - For very sparse rewards, consider lambda: 0.98-0.99 to better propagate signals
+    discount: 0.997          # γ - high for long-horizon tasks (obtaining diamonds can take 1000+ steps)
+    lambda: 0.95             # λ - TD(λ) trace decay (standard value, can increase to 0.98 for sparser rewards)
+    
+    # EMA target network settings (Section 4.4)
+    value_ema_decay: 0.999   # EMA decay rate for value target network (higher = slower updates)
     
     # PMPO (Equation 11)
     pmpo_alpha: 0.5          # α - weight for positive advantage updates
     pmpo_beta_kl: 0.3        # β - KL regularization to prior (paper default)
     entropy_coef: 0.003      # Entropy bonus for exploration
     advantage_bins: 16       # Number of bins for advantage binning
+    # Percentile-based binning for sparse MineRL rewards
+    use_percentile_binning: true
+    percentile_threshold: 10.0  # Top/bottom 10% for D+/D-
     
     # Learning rates
     policy_lr: 3.0e-5        # Slower than world model

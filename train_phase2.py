@@ -73,12 +73,18 @@ def create_heads(config: Dict) -> Dict[str, nn.Module]:
     # Input dimension is flattened latent tokens
     input_dim = config["tokenizer"]["num_latent_tokens"] * config["tokenizer"]["latent_dim"]
     
+    # MTP configuration (default: True to match paper Equation 9)
+    use_mtp = config["training"]["phase2"].get("use_mtp", True)
+    mtp_length = config["training"]["phase2"].get("mtp_length", 8)
+    
     heads = {
         "policy": PolicyHead(
             input_dim=input_dim,
             hidden_dim=config["heads"]["hidden_dim"],
             num_discrete_actions=config["dynamics"]["num_discrete_actions"],
             num_layers=config["heads"]["num_layers"],
+            mtp_length=mtp_length,
+            use_mtp=use_mtp,
         ),
         "value": ValueHead(
             input_dim=input_dim,
@@ -91,6 +97,8 @@ def create_heads(config: Dict) -> Dict[str, nn.Module]:
             hidden_dim=config["heads"]["hidden_dim"],
             num_layers=config["heads"]["num_layers"],
             num_bins=config["heads"]["num_bins"],
+            mtp_length=mtp_length,
+            use_mtp=use_mtp,
         ),
     }
     
@@ -127,22 +135,18 @@ def train_agent_step(
     # Flatten latents for heads
     batch_size, time_steps, num_latent, latent_dim = latents.shape
     latents_flat = latents.reshape(batch_size, time_steps, -1)  # (B, T, num_latent * latent_dim)
-    
-    # Forward through heads
-    policy_output = heads["policy"](latents_flat)
-    reward_output = heads["reward"](latents_flat)
-    
+
     # Handle action format
     if actions.dim() == 3 and actions.shape[-1] == 1:
         actions = actions.squeeze(-1)
-    
-    # Compute loss
+
+    # Compute loss (heads forward pass happens inside loss_fn)
     loss_dict = loss_fn(
-        policy_output=policy_output,
-        reward_output=reward_output,
-        target_actions=actions,
-        target_rewards=rewards,
+        policy_head=heads["policy"],
         reward_head=heads["reward"],
+        latents=latents_flat,
+        actions=actions,
+        rewards=rewards,
         action_type="discrete",
     )
     
@@ -223,11 +227,21 @@ def train_phase2(config: Dict, checkpoint_path: Optional[str] = None):
         image_size=(config["data"]["image_height"], config["data"]["image_width"]),
         num_workers=config["data"]["num_workers"],
         split="train",
+        max_episodes=config["data"].get("max_episodes", None),
     )
     
     # Create loss function
+    # MTP configuration (default: True to match paper Equation 9)
+    use_mtp = config["training"]["phase2"].get("use_mtp", True)
+    mtp_length = config["training"]["phase2"].get("mtp_length", 8)
+    
     loss_fn = AgentFinetuningLoss(
-        reward_weight=config["training"]["phase2"]["reward_weight"],
+        reward_weight=config["training"]["phase2"].get("reward_weight", 1.0),
+        num_prediction_steps=mtp_length,
+        use_focal_loss=config["training"]["phase2"].get("use_focal_loss", False),
+        focal_gamma=config["training"]["phase2"].get("focal_gamma", 2.0),
+        focal_alpha=config["training"]["phase2"].get("focal_alpha", 0.25),
+        use_mtp=use_mtp,
     )
     
     # Create optimizer (only for heads)
@@ -302,6 +316,15 @@ def train_phase2(config: Dict, checkpoint_path: Optional[str] = None):
                 writer.add_scalar("loss/reward", loss_dict["reward_loss"], global_step)
                 writer.add_scalar("metrics/bc_accuracy", loss_dict["bc_accuracy"], global_step)
                 writer.add_scalar("lr", scheduler.get_last_lr()[0], global_step)
+                
+                # Reward prediction monitoring (Issue 4: Reward Collapse Detection)
+                if "nonzero_ratio" in loss_dict:
+                    writer.add_scalar("rewards/nonzero_ratio", loss_dict["nonzero_ratio"], global_step)
+                if "pred_std" in loss_dict:
+                    writer.add_scalar("rewards/pred_std", loss_dict["pred_std"], global_step)
+                    # Warning if reward head collapses
+                    if loss_dict["pred_std"] < 0.01:
+                        print(f"WARNING [Step {global_step}]: Reward head may have collapsed (std={loss_dict['pred_std']:.4f})")
             
             global_step += 1
         

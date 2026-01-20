@@ -143,9 +143,11 @@ class ShortcutForcingLoss(nn.Module):
             )
         
         # Compute weighted MSE loss
-        # For d_min: weight = 1 (no ramp)
-        # For others: weight = w(τ)
-        effective_weights = d_min_mask * 1.0 + d_other_mask * weights
+        # For d_min: weight = 1 (no ramp, no tau scaling)
+        # For others (bootstrap): weight = (1-τ)² · w(τ) per Equation 7
+        # The (1-τ)² factor converts x-space loss to v-space loss scale
+        tau_squared_factor = (1 - signal_level) ** 2
+        effective_weights = d_min_mask * 1.0 + d_other_mask * weights * tau_squared_factor
         
         loss = self.compute_mse_loss(predicted_latents, effective_targets, effective_weights)
         
@@ -229,9 +231,13 @@ class BootstrapTargetComputer(nn.Module):
         )
         pred1 = result1["predicted_latents"]
         
-        # Intermediate latents after first half step
-        intermediate = noisy_latents + half_step.view(-1, 1, 1, 1) * (pred1 - noisy_latents)
-        
+        # Compute velocity from first half step: v₁ = x̂₁ - z_τ
+        v1 = pred1 - noisy_latents
+
+        # Intermediate latents after first half step: z_{τ+d/2} = z_τ + (d/2) · v₁
+        half_step_expanded = half_step.view(-1, 1, 1, 1)
+        intermediate = noisy_latents + half_step_expanded * v1
+
         # Second half step
         result2 = model(
             intermediate,
@@ -242,8 +248,15 @@ class BootstrapTargetComputer(nn.Module):
             add_noise_to_latents=False,
         )
         pred2 = result2["predicted_latents"]
-        
-        # Average of two half-step predictions
-        bootstrap_target = (pred1 + pred2) / 2
-        
+
+        # Compute velocity from second half step: v₂ = x̂₂ - z_{τ+d/2}
+        v2 = pred2 - intermediate
+
+        # Average velocities per Equation 3: v_target = (v₁ + v₂) / 2
+        v_target = (v1 + v2) / 2
+
+        # Convert back to x-space: x_target = z_τ + v_target
+        # This ensures one full step gives same result as two half-steps
+        bootstrap_target = noisy_latents + v_target
+
         return bootstrap_target

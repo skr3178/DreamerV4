@@ -181,6 +181,8 @@ def train_phase3(
         entropy_coef=config["phase3"]["entropy_coef"],
         num_bins=config["phase3"]["advantage_bins"],
         discrete_actions=True,
+        use_percentile_binning=config["phase3"].get("use_percentile_binning", False),
+        percentile_threshold=config["phase3"].get("percentile_threshold", 10.0),
     ).to(device)
     
     value_loss_fn = TDLambdaLoss(
@@ -189,6 +191,21 @@ def train_phase3(
         loss_scale=config["phase3"]["value_loss_scale"],
         use_distributional=True,
     ).to(device)
+    
+    # EMA target network for value learning (Section 4.4)
+    value_target_head = ValueHead(
+        input_dim=input_dim,
+        hidden_dim=config["heads"]["hidden_dim"],
+        num_layers=config["heads"]["num_layers"],
+        num_bins=config["heads"]["num_bins"],
+    ).to(device)
+    
+    # Initialize target network with main network weights
+    value_target_head.load_state_dict(value_head.state_dict())
+    value_target_head.eval()  # Target network is always in eval mode
+    
+    # EMA decay rate (default 0.999 per common practice, configurable)
+    value_ema_decay = config["phase3"].get("value_ema_decay", 0.999)
     
     # Optimizers (only for trainable heads)
     policy_optimizer = optim.AdamW(
@@ -282,11 +299,17 @@ def train_phase3(
             # ========== Value Update (TD(λ)) ==========
             value_optimizer.zero_grad()
             
+            # Use target network for bootstrap values (Section 4.4)
+            # Get bootstrap latent from last timestep
+            bootstrap_latent = flat_latents[:, -1] if flat_latents.shape[1] > 0 else None
+            
             value_result = value_loss_fn(
                 value_head=value_head,
                 latents=flat_latents,
                 rewards=rollout_data["rewards"],
                 dones=rollout_data["dones"],
+                bootstrap_latent=bootstrap_latent,
+                target_head=value_target_head,  # Use EMA target for bootstrap
             )
             
             value_loss = value_result["loss"]
@@ -298,6 +321,11 @@ def train_phase3(
             )
             
             value_optimizer.step()
+            
+            # Update EMA target network (Section 4.4)
+            with torch.no_grad():
+                for target_param, main_param in zip(value_target_head.parameters(), value_head.parameters()):
+                    target_param.data.mul_(value_ema_decay).add_(main_param.data, alpha=1.0 - value_ema_decay)
             
             # Track metrics
             epoch_policy_loss += policy_loss.item()
@@ -324,6 +352,22 @@ def train_phase3(
                 print(f"  Mean Return: {value_result['mean_return'].item():.2f}")
                 print(f"  D+ samples: {policy_result['n_positive'].item():.0f}")
                 print(f"  D- samples: {policy_result['n_negative'].item():.0f}")
+                
+                # Advantage statistics monitoring (Issue 3: Sparse Rewards Detection)
+                if "adv_mean" in policy_result:
+                    adv_mean = policy_result["adv_mean"].item()
+                    adv_std = policy_result["adv_std"].item()
+                    adv_min = policy_result["adv_min"].item()
+                    adv_max = policy_result["adv_max"].item()
+                    n_zero = policy_result.get("n_zero", torch.tensor(0.0)).item()
+                    
+                    print(f"  Advantage Stats: mean={adv_mean:.4f}, std={adv_std:.4f}, "
+                          f"range=[{adv_min:.4f}, {adv_max:.4f}], zeros={n_zero:.0f}")
+                    
+                    # Warning if degenerate advantage distribution
+                    if policy_result['n_positive'].item() < 10 and policy_result['n_negative'].item() < 10:
+                        print(f"  WARNING: Degenerate advantage distribution - no learning signal!")
+                        print(f"    Consider enabling percentile_binning or adding intrinsic rewards")
         
         # Epoch summary
         avg_policy_loss = epoch_policy_loss / num_batches

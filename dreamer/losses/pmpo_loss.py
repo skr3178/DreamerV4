@@ -42,6 +42,8 @@ class PMPOLoss(nn.Module):
         entropy_coef: float = 0.003,
         num_bins: int = 16,
         discrete_actions: bool = True,
+        use_percentile_binning: bool = False,
+        percentile_threshold: float = 10.0,
     ):
         """
         Args:
@@ -50,6 +52,8 @@ class PMPOLoss(nn.Module):
             entropy_coef: Entropy bonus coefficient for exploration
             num_bins: Number of bins for advantage binning
             discrete_actions: Whether action space is discrete
+            use_percentile_binning: Use percentile-based binning for sparse rewards
+            percentile_threshold: Percentile threshold (e.g., 10 = top/bottom 10%)
         """
         super().__init__()
         
@@ -58,6 +62,8 @@ class PMPOLoss(nn.Module):
         self.entropy_coef = entropy_coef
         self.num_bins = num_bins
         self.discrete_actions = discrete_actions
+        self.use_percentile_binning = use_percentile_binning
+        self.percentile_threshold = percentile_threshold
     
     def bin_advantages(
         self,
@@ -66,15 +72,30 @@ class PMPOLoss(nn.Module):
         """
         Bin advantages into D+ and D- sets.
         
+        Supports two modes:
+        1. Standard: positive_mask = advantages > 0, negative_mask = advantages < 0
+        2. Percentile-based: Use top/bottom percentiles for sparse reward scenarios
+        
         Args:
             advantages: Advantage values (batch * horizon,)
         
         Returns:
-            positive_mask: Boolean mask for D+ (positive advantages, > 0)
-            negative_mask: Boolean mask for D- (negative advantages, < 0)
+            positive_mask: Boolean mask for D+ (good actions)
+            negative_mask: Boolean mask for D- (bad actions)
         """
-        positive_mask = advantages > 0
-        negative_mask = advantages < 0  # Strictly negative (zero goes to neither, but rare)
+        if self.use_percentile_binning:
+            # Use percentile-based binning for sparse rewards
+            # Top percentile = good actions, bottom percentile = bad actions
+            threshold_pos = torch.quantile(advantages, 1 - self.percentile_threshold / 100)
+            threshold_neg = torch.quantile(advantages, self.percentile_threshold / 100)
+            
+            positive_mask = advantages > threshold_pos
+            negative_mask = advantages < threshold_neg
+        else:
+            # Standard zero-threshold binning
+            positive_mask = advantages > 0
+            negative_mask = advantages < 0  # Strictly negative (zero goes to neither, but rare)
+        
         return positive_mask, negative_mask
     
     def compute_kl_divergence(
@@ -169,13 +190,19 @@ class PMPOLoss(nn.Module):
             log_probs = dist.log_prob(flat_actions).sum(dim=-1)
         
         # Bin advantages into D+ and D- (Equation 11)
-        positive_mask = flat_advantages > 0   # D+: good actions
-        negative_mask = flat_advantages < 0    # D-: bad actions
+        positive_mask, negative_mask = self.bin_advantages(flat_advantages)
         
         # Count samples in each set
         n_positive = positive_mask.sum().float().clamp(min=1.0)
         n_negative = negative_mask.sum().float().clamp(min=1.0)
         n_total = float(flat_latents.shape[0])
+        
+        # Monitor advantage statistics for sparse reward detection
+        adv_mean = flat_advantages.mean()
+        adv_std = flat_advantages.std()
+        adv_min = flat_advantages.min()
+        adv_max = flat_advantages.max()
+        n_zero = (flat_advantages == 0).sum().float()
         
         # PMPO loss computation (Equation 11)
         # Positive advantages: decrease log_prob (negative coefficient)
@@ -224,6 +251,11 @@ class PMPOLoss(nn.Module):
             "entropy": entropy,
             "n_positive": n_positive,
             "n_negative": n_negative,
+            "adv_mean": adv_mean,
+            "adv_std": adv_std,
+            "adv_min": adv_min,
+            "adv_max": adv_max,
+            "n_zero": n_zero,
         }
 
 

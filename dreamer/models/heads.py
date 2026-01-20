@@ -22,6 +22,10 @@ class PolicyHead(nn.Module):
     """
     Policy head for action prediction.
     
+    Supports both:
+    - Standard mode: Predicts action for each timestep independently
+    - MTP mode: Predicts L+1 future actions from a single embedding h_t (Multi-Token Prediction)
+    
     Outputs action distribution conditioned on latent state.
     Supports both discrete and continuous action spaces.
     """
@@ -33,6 +37,8 @@ class PolicyHead(nn.Module):
         num_discrete_actions: Optional[int] = None,
         continuous_action_dim: Optional[int] = None,
         num_layers: int = 2,
+        mtp_length: int = 8,
+        use_mtp: bool = True,
     ):
         """
         Args:
@@ -41,12 +47,16 @@ class PolicyHead(nn.Module):
             num_discrete_actions: Number of discrete actions (if discrete)
             continuous_action_dim: Dimension of continuous actions (if continuous)
             num_layers: Number of hidden layers
+            mtp_length: Length L for MTP (predicts n=0 to L, so L+1 timesteps per Equation 9)
+            use_mtp: Whether to use Multi-Token Prediction mode (default True per paper)
         """
         super().__init__()
         
         self.input_dim = input_dim
         self.num_discrete_actions = num_discrete_actions
         self.continuous_action_dim = continuous_action_dim
+        self.mtp_length = mtp_length
+        self.use_mtp = use_mtp
         
         # Build MLP layers
         layers = []
@@ -63,12 +73,22 @@ class PolicyHead(nn.Module):
         
         # Output heads
         if num_discrete_actions is not None:
-            self.action_head = nn.Linear(hidden_dim, num_discrete_actions)
+            if use_mtp:
+                # MTP: predict L+1 timesteps from single h_t
+                self.action_head = nn.Linear(hidden_dim, (mtp_length + 1) * num_discrete_actions)
+            else:
+                # Standard: predict single timestep
+                self.action_head = nn.Linear(hidden_dim, num_discrete_actions)
         
         if continuous_action_dim is not None:
-            # Output mean and log_std for Gaussian policy
-            self.mean_head = nn.Linear(hidden_dim, continuous_action_dim)
-            self.log_std_head = nn.Linear(hidden_dim, continuous_action_dim)
+            if use_mtp:
+                # MTP: predict L+1 timesteps
+                self.mean_head = nn.Linear(hidden_dim, (mtp_length + 1) * continuous_action_dim)
+                self.log_std_head = nn.Linear(hidden_dim, (mtp_length + 1) * continuous_action_dim)
+            else:
+                # Standard: predict single timestep
+                self.mean_head = nn.Linear(hidden_dim, continuous_action_dim)
+                self.log_std_head = nn.Linear(hidden_dim, continuous_action_dim)
     
     def forward(
         self,
@@ -78,10 +98,14 @@ class PolicyHead(nn.Module):
         Compute action distribution from latent state.
         
         Args:
-            latents: Latent representation (batch, ..., input_dim)
+            latents: Latent representation 
+                - Standard mode: (batch, ..., input_dim)
+                - MTP mode: (batch, input_dim) - single h_t embedding
         
         Returns:
             Dictionary containing distribution parameters
+                - Standard mode: (batch, ..., num_actions)
+                - MTP mode: (batch, mtp_length+1, num_actions) - predictions for n=0 to L
         """
         # Flatten if needed
         original_shape = latents.shape[:-1]
@@ -94,7 +118,15 @@ class PolicyHead(nn.Module):
         
         if self.num_discrete_actions is not None:
             logits = self.action_head(hidden)
-            logits = logits.reshape(*original_shape, self.num_discrete_actions)
+            
+            if self.use_mtp:
+                # MTP: reshape to (batch, mtp_length+1, num_actions)
+                batch_size = logits.shape[0]
+                logits = logits.reshape(batch_size, self.mtp_length + 1, self.num_discrete_actions)
+            else:
+                # Standard: reshape to original shape
+                logits = logits.reshape(*original_shape, self.num_discrete_actions)
+            
             result["logits"] = logits
             result["probs"] = F.softmax(logits, dim=-1)
         
@@ -103,8 +135,15 @@ class PolicyHead(nn.Module):
             log_std = self.log_std_head(hidden)
             log_std = torch.clamp(log_std, -20, 2)  # Stability
             
-            mean = mean.reshape(*original_shape, self.continuous_action_dim)
-            log_std = log_std.reshape(*original_shape, self.continuous_action_dim)
+            if self.use_mtp:
+                # MTP: reshape to (batch, mtp_length+1, action_dim)
+                batch_size = mean.shape[0]
+                mean = mean.reshape(batch_size, self.mtp_length + 1, self.continuous_action_dim)
+                log_std = log_std.reshape(batch_size, self.mtp_length + 1, self.continuous_action_dim)
+            else:
+                # Standard: reshape to original shape
+                mean = mean.reshape(*original_shape, self.continuous_action_dim)
+                log_std = log_std.reshape(*original_shape, self.continuous_action_dim)
             
             result["mean"] = mean
             result["log_std"] = log_std
@@ -195,6 +234,7 @@ class ValueHead(nn.Module):
         num_layers: int = 2,
         num_bins: int = 255,
         value_range: Tuple[float, float] = (-20.0, 20.0),
+        use_symlog: bool = True,
     ):
         """
         Args:
@@ -203,12 +243,14 @@ class ValueHead(nn.Module):
             num_layers: Number of hidden layers
             num_bins: Number of bins for distributional value
             value_range: (min, max) value range
+            use_symlog: Whether to use symlog bin spacing (default True per paper Appendix)
         """
         super().__init__()
         
         self.input_dim = input_dim
         self.num_bins = num_bins
         self.value_range = value_range
+        self.use_symlog = use_symlog
         
         # Build MLP layers
         layers = []
@@ -226,9 +268,27 @@ class ValueHead(nn.Module):
         # Output head (distributional)
         self.value_head = nn.Linear(hidden_dim, num_bins)
         
-        # Precompute bin centers
-        bin_centers = torch.linspace(value_range[0], value_range[1], num_bins)
+        # Precompute bin centers with symlog spacing
+        if use_symlog:
+            # Create bins in symlog space, then convert back
+            symlog_min = self._symlog(value_range[0])
+            symlog_max = self._symlog(value_range[1])
+            symlog_bin_centers = torch.linspace(symlog_min, symlog_max, num_bins)
+            bin_centers = self._symexp(symlog_bin_centers)
+        else:
+            # Linear spacing (backward compatibility)
+            bin_centers = torch.linspace(value_range[0], value_range[1], num_bins)
         self.register_buffer("bin_centers", bin_centers)
+    
+    @staticmethod
+    def _symlog(x: torch.Tensor) -> torch.Tensor:
+        """Symmetric logarithm: sign(x) * ln(|x| + 1)"""
+        return torch.sign(x) * torch.log1p(torch.abs(x))
+    
+    @staticmethod
+    def _symexp(x: torch.Tensor) -> torch.Tensor:
+        """Inverse of symlog: sign(x) * (exp(|x|) - 1)"""
+        return torch.sign(x) * (torch.exp(torch.abs(x)) - 1)
     
     def forward(self, latents: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
@@ -276,9 +336,19 @@ class ValueHead(nn.Module):
         # Clamp target to valid range
         target = target.clamp(self.value_range[0], self.value_range[1])
         
-        # Find bin indices
-        bin_width = (self.value_range[1] - self.value_range[0]) / (self.num_bins - 1)
-        bin_idx = (target - self.value_range[0]) / bin_width
+        if self.use_symlog:
+            # Convert to symlog space for binning
+            symlog_target = self._symlog(target)
+            symlog_min = self._symlog(self.value_range[0])
+            symlog_max = self._symlog(self.value_range[1])
+            
+            # Find bin indices in symlog space
+            bin_width = (symlog_max - symlog_min) / (self.num_bins - 1)
+            bin_idx = (symlog_target - symlog_min) / bin_width
+        else:
+            # Linear binning (backward compatibility)
+            bin_width = (self.value_range[1] - self.value_range[0]) / (self.num_bins - 1)
+            bin_idx = (target - self.value_range[0]) / bin_width
         
         # Two-hot encoding
         lower_idx = bin_idx.floor().long().clamp(0, self.num_bins - 2)
@@ -298,6 +368,10 @@ class RewardHead(nn.Module):
     """
     Reward head for reward prediction r(s).
     
+    Supports both:
+    - Standard mode: Predicts reward for each timestep independently
+    - MTP mode: Predicts L+1 future rewards from a single embedding h_t (Multi-Token Prediction)
+    
     Predicts expected reward at each state.
     """
     
@@ -308,6 +382,9 @@ class RewardHead(nn.Module):
         num_layers: int = 2,
         num_bins: int = 255,
         reward_range: Tuple[float, float] = (-10.0, 10.0),
+        mtp_length: int = 8,
+        use_mtp: bool = True,
+        use_symlog: bool = True,
     ):
         """
         Args:
@@ -316,12 +393,18 @@ class RewardHead(nn.Module):
             num_layers: Number of hidden layers
             num_bins: Number of bins for distributional reward
             reward_range: (min, max) reward range
+            mtp_length: Length L for MTP (predicts n=0 to L, so L+1 timesteps per Equation 9)
+            use_mtp: Whether to use Multi-Token Prediction mode (default True per paper)
+            use_symlog: Whether to use symlog bin spacing (default True per paper Appendix)
         """
         super().__init__()
         
         self.input_dim = input_dim
         self.num_bins = num_bins
         self.reward_range = reward_range
+        self.mtp_length = mtp_length
+        self.use_mtp = use_mtp
+        self.use_symlog = use_symlog
         
         # Build MLP layers
         layers = []
@@ -337,23 +420,50 @@ class RewardHead(nn.Module):
         self.mlp = nn.Sequential(*layers)
         
         # Output head
-        self.reward_head = nn.Linear(hidden_dim, num_bins)
+        if use_mtp:
+            # MTP: predict L+1 timesteps from single h_t
+            self.reward_head = nn.Linear(hidden_dim, (mtp_length + 1) * num_bins)
+        else:
+            # Standard: predict single timestep
+            self.reward_head = nn.Linear(hidden_dim, num_bins)
         
-        # Precompute bin centers
-        bin_centers = torch.linspace(reward_range[0], reward_range[1], num_bins)
+        # Precompute bin centers with symlog spacing
+        if use_symlog:
+            # Create bins in symlog space, then convert back
+            symlog_min = self._symlog(reward_range[0])
+            symlog_max = self._symlog(reward_range[1])
+            symlog_bin_centers = torch.linspace(symlog_min, symlog_max, num_bins)
+            bin_centers = self._symexp(symlog_bin_centers)
+        else:
+            # Linear spacing (backward compatibility)
+            bin_centers = torch.linspace(reward_range[0], reward_range[1], num_bins)
         self.register_buffer("bin_centers", bin_centers)
+    
+    @staticmethod
+    def _symlog(x: torch.Tensor) -> torch.Tensor:
+        """Symmetric logarithm: sign(x) * ln(|x| + 1)"""
+        return torch.sign(x) * torch.log1p(torch.abs(x))
+    
+    @staticmethod
+    def _symexp(x: torch.Tensor) -> torch.Tensor:
+        """Inverse of symlog: sign(x) * (exp(|x|) - 1)"""
+        return torch.sign(x) * (torch.exp(torch.abs(x)) - 1)
     
     def forward(self, latents: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
         Compute reward distribution and expected reward.
         
         Args:
-            latents: Latent representation (batch, ..., input_dim)
+            latents: Latent representation
+                - Standard mode: (batch, ..., input_dim)
+                - MTP mode: (batch, input_dim) - single h_t embedding
         
         Returns:
             Dictionary containing:
                 - logits: Distribution logits
-                - probs: Distribution probabilities  
+                    - Standard mode: (batch, ..., num_bins)
+                    - MTP mode: (batch, mtp_length+1, num_bins) - predictions for n=0 to L
+                - probs: Distribution probabilities
                 - reward: Expected reward
         """
         original_shape = latents.shape[:-1]
@@ -362,13 +472,16 @@ class RewardHead(nn.Module):
         hidden = self.mlp(latents)
         logits = self.reward_head(hidden)
         
+        if self.use_mtp:
+            # MTP: reshape to (batch, mtp_length+1, num_bins)
+            batch_size = logits.shape[0]
+            logits = logits.reshape(batch_size, self.mtp_length + 1, self.num_bins)
+        else:
+            # Standard: reshape to original shape
+            logits = logits.reshape(*original_shape, self.num_bins)
+        
         probs = F.softmax(logits, dim=-1)
         reward = (probs * self.bin_centers).sum(dim=-1)
-        
-        # Reshape outputs
-        logits = logits.reshape(*original_shape, self.num_bins)
-        probs = probs.reshape(*original_shape, self.num_bins)
-        reward = reward.reshape(*original_shape)
         
         return {
             "logits": logits,
@@ -380,8 +493,19 @@ class RewardHead(nn.Module):
         """Convert target rewards to bin distribution targets."""
         target = target.clamp(self.reward_range[0], self.reward_range[1])
         
-        bin_width = (self.reward_range[1] - self.reward_range[0]) / (self.num_bins - 1)
-        bin_idx = (target - self.reward_range[0]) / bin_width
+        if self.use_symlog:
+            # Convert to symlog space for binning
+            symlog_target = self._symlog(target)
+            symlog_min = self._symlog(self.reward_range[0])
+            symlog_max = self._symlog(self.reward_range[1])
+            
+            # Find bin indices in symlog space
+            bin_width = (symlog_max - symlog_min) / (self.num_bins - 1)
+            bin_idx = (symlog_target - symlog_min) / bin_width
+        else:
+            # Linear binning (backward compatibility)
+            bin_width = (self.reward_range[1] - self.reward_range[0]) / (self.num_bins - 1)
+            bin_idx = (target - self.reward_range[0]) / bin_width
         
         lower_idx = bin_idx.floor().long().clamp(0, self.num_bins - 2)
         upper_idx = lower_idx + 1

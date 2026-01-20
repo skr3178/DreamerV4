@@ -114,9 +114,10 @@ class ImaginationRollout(nn.Module):
         
         # Iterative denoising with shortcut forcing
         for step in range(self.num_denoising_steps):
-            # Fix: tau should reach 1.0 at final step
-            # For K=4: tau goes 0.25, 0.5, 0.75, 1.0 (instead of 0, 0.25, 0.5, 0.75)
-            tau = (step + 1) * step_size_val
+            # τ is the signal level of current z BEFORE the update
+            # For K=4: τ goes 0, 0.25, 0.5, 0.75 (z reaches τ=1 AFTER final update)
+            # This matches dynamics.py generate() method
+            tau = step * step_size_val
             tau_tensor = torch.full((batch_size,), tau, device=device)
             d_tensor = torch.full((batch_size,), step_size_val, device=device)
             

@@ -162,49 +162,130 @@ def create_block_causal_mask(
 ) -> torch.Tensor:
     """
     Create a block-causal attention mask.
-    
+
     In block-causal attention:
     - Tokens within the same block can attend to each other (bidirectional)
     - Tokens can attend to all tokens in previous blocks
     - Tokens cannot attend to future blocks
-    
+
     Args:
         seq_len: Total sequence length
         block_size: Size of each block (e.g., spatial tokens per timestep)
         device: Device to create mask on
-    
+
     Returns:
         Attention mask of shape (seq_len, seq_len)
         True = attend, False = mask out
     """
     mask = torch.zeros(seq_len, seq_len, dtype=torch.bool, device=device)
-    
+
     num_blocks = (seq_len + block_size - 1) // block_size
-    
+
     for i in range(num_blocks):
         block_start = i * block_size
         block_end = min((i + 1) * block_size, seq_len)
-        
+
         # Attend to all previous blocks
         mask[block_start:block_end, :block_end] = True
-    
+
+    return mask
+
+
+def create_spatial_mask(
+    seq_len: int,
+    block_size: int,
+    device: torch.device = None,
+) -> torch.Tensor:
+    """
+    Create a spatial attention mask (Section 3.2).
+
+    Spatial attention: tokens only attend within their own block (timestep).
+    This is bidirectional within the block, no cross-timestep attention.
+
+    Args:
+        seq_len: Total sequence length
+        block_size: Size of each block (tokens per timestep)
+        device: Device to create mask on
+
+    Returns:
+        Attention mask of shape (seq_len, seq_len)
+        True = attend, False = mask out
+    """
+    mask = torch.zeros(seq_len, seq_len, dtype=torch.bool, device=device)
+
+    num_blocks = (seq_len + block_size - 1) // block_size
+
+    for i in range(num_blocks):
+        block_start = i * block_size
+        block_end = min((i + 1) * block_size, seq_len)
+
+        # Only attend within the same block (bidirectional)
+        mask[block_start:block_end, block_start:block_end] = True
+
+    return mask
+
+
+def create_temporal_mask(
+    seq_len: int,
+    block_size: int,
+    device: torch.device = None,
+) -> torch.Tensor:
+    """
+    Create a temporal attention mask (Section 3.2).
+
+    Temporal attention: tokens attend to the same position across timesteps.
+    This is causal across time (can only attend to past timesteps).
+
+    For example, with block_size=4:
+    - Token 0 attends to tokens 0, 4, 8, ... (same position in each block)
+    - Token 1 attends to tokens 1, 5, 9, ...
+    - But only causally (past and current blocks)
+
+    Args:
+        seq_len: Total sequence length
+        block_size: Size of each block (tokens per timestep)
+        device: Device to create mask on
+
+    Returns:
+        Attention mask of shape (seq_len, seq_len)
+        True = attend, False = mask out
+    """
+    mask = torch.zeros(seq_len, seq_len, dtype=torch.bool, device=device)
+
+    num_blocks = (seq_len + block_size - 1) // block_size
+
+    for i in range(seq_len):
+        # Which block is this token in?
+        current_block = i // block_size
+        # Position within the block
+        pos_in_block = i % block_size
+
+        # Attend to same position in current and all past blocks
+        for b in range(current_block + 1):
+            target_idx = b * block_size + pos_in_block
+            if target_idx < seq_len:
+                mask[i, target_idx] = True
+
     return mask
 
 
 class BlockCausalAttention(nn.Module):
     """
-    Block-Causal Multi-Head Attention.
-    
+    Block-Causal Multi-Head Attention with optional Grouped Query Attention (GQA).
+
     Implements the attention pattern from DreamerV4:
     - Tokens within the same timestep can attend to each other
     - Tokens can attend to all past timesteps
     - Cannot attend to future timesteps
+
+    GQA (Section 3.2): Uses fewer KV heads than query heads to reduce KV cache size.
     """
-    
+
     def __init__(
         self,
         dim: int,
         num_heads: int = 8,
+        num_kv_heads: Optional[int] = None,
         head_dim: Optional[int] = None,
         dropout: float = 0.0,
         use_qk_norm: bool = True,
@@ -214,22 +295,31 @@ class BlockCausalAttention(nn.Module):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
+        # GQA: num_kv_heads can be less than num_heads
+        # Default to num_heads (standard MHA) if not specified
+        self.num_kv_heads = num_kv_heads or num_heads
         self.head_dim = head_dim or dim // num_heads
         self.scale = self.head_dim ** -0.5
         self.use_qk_norm = use_qk_norm
         self.use_flash_attention = use_flash_attention
         self.allow_flash_only_for_standard_causal = allow_flash_only_for_standard_causal
-        
-        # QKV projection
-        self.qkv = nn.Linear(dim, 3 * num_heads * self.head_dim, bias=False)
-        
+
+        # Validate GQA config
+        assert num_heads % self.num_kv_heads == 0, \
+            f"num_heads ({num_heads}) must be divisible by num_kv_heads ({self.num_kv_heads})"
+        self.num_queries_per_kv = num_heads // self.num_kv_heads
+
+        # Separate Q and KV projections for GQA
+        self.q_proj = nn.Linear(dim, num_heads * self.head_dim, bias=False)
+        self.kv_proj = nn.Linear(dim, 2 * self.num_kv_heads * self.head_dim, bias=False)
+
         # Output projection
         self.out_proj = nn.Linear(num_heads * self.head_dim, dim, bias=False)
-        
+
         # QK normalization
         if use_qk_norm:
             self.qk_norm = QKNorm(self.head_dim)
-        
+
         self.dropout = nn.Dropout(dropout)
     
     def forward(
@@ -245,30 +335,40 @@ class BlockCausalAttention(nn.Module):
             rope_cos: Rotary position embedding cosines
             rope_sin: Rotary position embedding sines
             attention_mask: Boolean mask (True = attend, False = mask)
-        
+
         Returns:
             Output tensor of shape (batch, seq_len, dim)
         """
         batch_size, seq_len, _ = x.shape
-        
-        # Compute Q, K, V
-        qkv = self.qkv(x)
-        qkv = rearrange(
-            qkv, 
-            "b s (three h d) -> three b h s d", 
-            three=3, 
-            h=self.num_heads, 
+
+        # Compute Q (all heads)
+        q = self.q_proj(x)
+        q = rearrange(q, "b s (h d) -> b h s d", h=self.num_heads, d=self.head_dim)
+
+        # Compute K, V (fewer heads for GQA)
+        kv = self.kv_proj(x)
+        kv = rearrange(
+            kv,
+            "b s (two h d) -> two b h s d",
+            two=2,
+            h=self.num_kv_heads,
             d=self.head_dim
         )
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        
-        # Apply QK normalization
+        k, v = kv[0], kv[1]
+
+        # Apply QK normalization (before repeating KV for GQA)
         if self.use_qk_norm:
             q, k = self.qk_norm(q, k)
-        
-        # Apply rotary position embeddings
+
+        # Apply rotary position embeddings (before repeating KV for GQA)
         if rope_cos is not None and rope_sin is not None:
             q, k = apply_rotary_pos_emb(q, k, rope_cos, rope_sin)
+
+        # GQA: Repeat K and V to match number of query heads
+        if self.num_kv_heads < self.num_heads:
+            # Repeat each KV head to serve multiple query heads
+            k = repeat(k, "b h s d -> b (h r) s d", r=self.num_queries_per_kv)
+            v = repeat(v, "b h s d -> b (h r) s d", r=self.num_queries_per_kv)
         
         # ────────────────────────────────────────────────────────────────
         # Attention computation
@@ -327,30 +427,32 @@ class BlockCausalAttention(nn.Module):
 class TransformerBlock(nn.Module):
     """
     Single Transformer Block with Pre-Norm architecture.
-    
+
     Structure:
     1. RMSNorm -> Block-Causal Attention -> Residual
     2. RMSNorm -> SwiGLU FFN -> Residual
     """
-    
+
     def __init__(
         self,
         dim: int,
         num_heads: int = 8,
+        num_kv_heads: Optional[int] = None,
         head_dim: Optional[int] = None,
         ffn_dim: Optional[int] = None,
         dropout: float = 0.0,
         use_qk_norm: bool = True,
     ):
         super().__init__()
-        
+
         # Pre-norm for attention
         self.norm1 = RMSNorm(dim)
-        
-        # Block-causal attention
+
+        # Block-causal attention with optional GQA
         self.attention = BlockCausalAttention(
             dim=dim,
             num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             dropout=dropout,
             use_qk_norm=use_qk_norm,
@@ -400,59 +502,70 @@ class TransformerBlock(nn.Module):
 class BlockCausalTransformer(nn.Module):
     """
     Block-Causal Transformer - Core unified architecture for DreamerV4.
-    
+
     This is the shared architecture used by both:
     - Causal Tokenizer (for encoding/decoding frames)
     - Dynamics Model (for predicting future states)
-    
+
     Key features:
     - Pre-layer RMSNorm
     - Block-causal attention pattern
     - RoPE position embeddings
     - SwiGLU activation
     - QK-Norm for stability
+    - Space/time factorized attention (Section 3.2)
     """
-    
+
     def __init__(
         self,
         dim: int,
         depth: int,
         num_heads: int = 8,
+        num_kv_heads: Optional[int] = None,
         head_dim: Optional[int] = None,
         ffn_dim: Optional[int] = None,
         max_seq_len: int = 8192,
         dropout: float = 0.0,
         use_qk_norm: bool = True,
+        use_spacetime_factorization: bool = False,
+        temporal_layer_interval: int = 4,
     ):
         """
         Args:
             dim: Model dimension
             depth: Number of transformer layers
             num_heads: Number of attention heads
+            num_kv_heads: Number of KV heads for GQA (default: same as num_heads)
             head_dim: Dimension per head (default: dim // num_heads)
             ffn_dim: FFN hidden dimension (default: ~2.67 * dim for SwiGLU)
             max_seq_len: Maximum sequence length for position embeddings
             dropout: Dropout probability
             use_qk_norm: Whether to use QK normalization
+            use_spacetime_factorization: Whether to use space/time factorized attention (Section 3.2)
+            temporal_layer_interval: Apply temporal attention every N layers (default: 4)
         """
         super().__init__()
-        
+
         self.dim = dim
         self.depth = depth
         self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim or dim // num_heads
-        
+        self.use_spacetime_factorization = use_spacetime_factorization
+        self.temporal_layer_interval = temporal_layer_interval
+
         # Rotary position embeddings
         self.rope = RotaryPositionEmbedding(
             dim=self.head_dim,
             max_seq_len=max_seq_len,
         )
-        
-        # Transformer layers
+
+        # Transformer layers with optional GQA
         self.layers = nn.ModuleList([
             TransformerBlock(
                 dim=dim,
                 num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
                 head_dim=head_dim,
                 ffn_dim=ffn_dim,
                 dropout=dropout,
@@ -460,10 +573,15 @@ class BlockCausalTransformer(nn.Module):
             )
             for _ in range(depth)
         ])
-        
+
         # Final normalization
         self.final_norm = RMSNorm(dim)
-    
+
+    def _is_temporal_layer(self, layer_idx: int) -> bool:
+        """Check if this layer should use temporal attention."""
+        # Temporal attention every N layers (0-indexed: 3, 7, 11, ... for interval=4)
+        return (layer_idx + 1) % self.temporal_layer_interval == 0
+
     def forward(
         self,
         x: torch.Tensor,
@@ -473,39 +591,66 @@ class BlockCausalTransformer(nn.Module):
         """
         Args:
             x: Input tensor of shape (batch, seq_len, dim)
-            attention_mask: Optional custom attention mask
-            block_size: If provided, creates block-causal mask with this block size
-        
+            attention_mask: Optional custom attention mask (overrides factorization)
+            block_size: Block size for creating masks (tokens per timestep)
+
         Returns:
             Output tensor of shape (batch, seq_len, dim)
         """
-        batch_size, seq_len, _ = x.shape
-        
+        _, seq_len, _ = x.shape
+
         # Get rotary embeddings
         rope_cos, rope_sin = self.rope(x, seq_len)
-        
-        # Create block-causal mask if block_size is provided
-        if block_size is not None and attention_mask is None:
-            attention_mask = create_block_causal_mask(
+
+        # Create masks for space/time factorized attention if enabled
+        if self.use_spacetime_factorization and block_size is not None and attention_mask is None:
+            spatial_mask = create_spatial_mask(
                 seq_len=seq_len,
                 block_size=block_size,
                 device=x.device,
             )
-        
-        # Forward through transformer layers
-        for layer in self.layers:
-            x = layer(
-                x,
-                rope_cos=rope_cos,
-                rope_sin=rope_sin,
-                attention_mask=attention_mask,
+            temporal_mask = create_temporal_mask(
+                seq_len=seq_len,
+                block_size=block_size,
+                device=x.device,
             )
-        
+
+            # Forward through transformer layers with factorized attention
+            for layer_idx, layer in enumerate(self.layers):
+                if self._is_temporal_layer(layer_idx):
+                    layer_mask = temporal_mask
+                else:
+                    layer_mask = spatial_mask
+
+                x = layer(
+                    x,
+                    rope_cos=rope_cos,
+                    rope_sin=rope_sin,
+                    attention_mask=layer_mask,
+                )
+        else:
+            # Original behavior: same mask for all layers
+            if block_size is not None and attention_mask is None:
+                attention_mask = create_block_causal_mask(
+                    seq_len=seq_len,
+                    block_size=block_size,
+                    device=x.device,
+                )
+
+            # Forward through transformer layers
+            for layer in self.layers:
+                x = layer(
+                    x,
+                    rope_cos=rope_cos,
+                    rope_sin=rope_sin,
+                    attention_mask=attention_mask,
+                )
+
         # Final normalization
         x = self.final_norm(x)
-        
+
         return x
-    
+
     def get_num_params(self) -> int:
         """Return total number of parameters."""
         return sum(p.numel() for p in self.parameters())

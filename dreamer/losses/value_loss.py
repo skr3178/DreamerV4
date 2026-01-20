@@ -106,16 +106,18 @@ class TDLambdaLoss(nn.Module):
         rewards: torch.Tensor,
         dones: torch.Tensor,
         bootstrap_latent: Optional[torch.Tensor] = None,
+        target_head: Optional[nn.Module] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Compute TD(λ) value loss.
         
         Args:
-            value_head: Value head network
+            value_head: Value head network (main network for predictions)
             latents: Flattened latent states (batch, horizon, latent_dim)
             rewards: Predicted rewards (batch, horizon)
             dones: Done flags (batch, horizon)
             bootstrap_latent: Final state latent for bootstrapping
+            target_head: Optional target network for bootstrap values (EMA target, Section 4.4)
         
         Returns:
             Dictionary containing:
@@ -127,15 +129,17 @@ class TDLambdaLoss(nn.Module):
         batch_size, horizon = rewards.shape
         device = latents.device
         
-        # Get value predictions
+        # Get value predictions from main network
         flat_latents = latents.reshape(-1, latents.shape[-1])
         value_output = value_head(flat_latents)
         values = value_output["value"].reshape(batch_size, horizon)
         
-        # Compute bootstrap value
+        # Compute bootstrap value using target network if provided (Section 4.4)
         if bootstrap_latent is not None:
             with torch.no_grad():
-                bootstrap_output = value_head(bootstrap_latent)
+                # Use target network for bootstrap if available, otherwise use main network
+                bootstrap_head = target_head if target_head is not None else value_head
+                bootstrap_output = bootstrap_head(bootstrap_latent)
                 bootstrap_value = bootstrap_output["value"]
         else:
             # Use last predicted value as bootstrap

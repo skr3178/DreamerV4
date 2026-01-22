@@ -162,16 +162,24 @@ data/vpt-owamcap/
 *.pickle
 *.safetensors
 checkpoints/
+checkpoint*/
+checkpoint-*
+step-*
+epoch-*
 models/
 weights/
 runs/
 wandb/
 tensorboard_logs/
+*.state_dict
+*.optimizer
+*.scheduler
 
 # Logs
 *.log
 logs/
 *.out
+*.err
 
 # Temporary files
 *.tmp
@@ -198,3 +206,16 @@ PMPO/
 flow/
 Block_cascading/
 shortcut_models/
+
+# Generated videos directory
+videos/
+
+# Large dataset directories
+data/mineRL_subset/
+BC_behavior_cloning/
+MNIST/data/
+minecraft-bc/
+
+# Generated images directory
+generated_images/
+*.png

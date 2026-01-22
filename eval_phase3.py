@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Evaluate Phase 2 trained model (Agent Finetuning)."""
+"""Evaluate Phase 3 trained model (Imagination RL with PMPO).
+
+This script:
+1. Loads Phase 2 checkpoint for tokenizer and dynamics (world model)
+2. Loads Phase 3 checkpoint for trained heads (policy, value, reward)
+3. Evaluates the combined model on real data
+"""
 
 import torch
 import yaml
 from pathlib import Path
-import matplotlib.pyplot as plt
 import numpy as np
 import argparse
 import sys
@@ -15,131 +20,43 @@ from dreamer.models import CausalTokenizer, DynamicsModel
 from dreamer.models import PolicyHead, ValueHead, RewardHead
 from dreamer.losses import AgentFinetuningLoss
 from dreamer.data import create_dataloader
-from dreamer.utils import set_seed, strip_compiled_prefix, load_state_dict_with_warnings
+from dreamer.utils import set_seed, load_phase2_world_model as _load_phase2_world_model, load_phase3_heads as _load_phase3_heads
+from eval_phase2 import load_config, create_tokenizer, create_dynamics_model, create_heads
 
 
-def load_config(config_path: str) -> Dict:
-    """Load configuration from YAML file."""
-    with open(config_path, "r") as f:
-        return yaml.safe_load(f)
-
-
-def create_tokenizer(config: Dict) -> CausalTokenizer:
-    """Create tokenizer model from config."""
-    return CausalTokenizer(
-        image_height=config["data"]["image_height"],
-        image_width=config["data"]["image_width"],
-        in_channels=config["data"]["in_channels"],
-        patch_size=config["tokenizer"]["patch_size"],
-        embed_dim=config["tokenizer"]["embed_dim"],
-        latent_dim=config["tokenizer"]["latent_dim"],
-        num_latent_tokens=config["tokenizer"]["num_latent_tokens"],
-        depth=config["tokenizer"]["depth"],
-        num_heads=config["tokenizer"]["num_heads"],
-        dropout=config["tokenizer"]["dropout"],
-        num_registers=config["tokenizer"]["num_registers"],
-        mask_ratio=config["tokenizer"]["mask_ratio"],
+def load_phase2_world_model(checkpoint_path: str, config: Dict, device: torch.device):
+    """Load Phase 2 checkpoint for tokenizer and dynamics only (not heads)."""
+    return _load_phase2_world_model(
+        checkpoint_path, config, device,
+        create_tokenizer_fn=create_tokenizer,
+        create_dynamics_fn=create_dynamics_model,
     )
 
 
-def create_dynamics_model(config: Dict) -> DynamicsModel:
-    """Create dynamics model from config."""
-    return DynamicsModel(
-        latent_dim=config["tokenizer"]["latent_dim"],
-        num_latent_tokens=config["tokenizer"]["num_latent_tokens"],
-        embed_dim=config["tokenizer"]["embed_dim"],
-        depth=config["tokenizer"]["depth"],
-        num_heads=config["tokenizer"]["num_heads"],
-        dropout=config["tokenizer"]["dropout"],
-        num_discrete_actions=config["dynamics"]["num_discrete_actions"],
-        num_registers=config["dynamics"]["num_registers"],
-        max_shortcut_steps=config["dynamics"]["max_shortcut_steps"],
+def load_phase3_heads(checkpoint_path: str, config: Dict, device: torch.device):
+    """Load Phase 3 checkpoint for heads (policy, value, reward)."""
+    return _load_phase3_heads(
+        checkpoint_path, config, device,
+        create_heads_fn=create_heads,
     )
 
 
-def create_heads(config: Dict) -> Dict[str, torch.nn.Module]:
-    """Create agent heads from config."""
-    input_dim = config["tokenizer"]["num_latent_tokens"] * config["tokenizer"]["latent_dim"]
-    
-    use_mtp = config["training"]["phase2"].get("use_mtp", True)
-    mtp_length = config["training"]["phase2"].get("mtp_length", 8)
-    
-    heads = {
-        "policy": PolicyHead(
-            input_dim=input_dim,
-            hidden_dim=config["heads"]["hidden_dim"],
-            num_discrete_actions=config["dynamics"]["num_discrete_actions"],
-            num_layers=config["heads"]["num_layers"],
-            mtp_length=mtp_length,
-            use_mtp=use_mtp,
-        ),
-        "value": ValueHead(
-            input_dim=input_dim,
-            hidden_dim=config["heads"]["hidden_dim"],
-            num_layers=config["heads"]["num_layers"],
-            num_bins=config["heads"]["num_bins"],
-        ),
-        "reward": RewardHead(
-            input_dim=input_dim,
-            hidden_dim=config["heads"]["hidden_dim"],
-            num_layers=config["heads"]["num_layers"],
-            num_bins=config["heads"]["num_bins"],
-            mtp_length=mtp_length,
-            use_mtp=use_mtp,
-        ),
-    }
-    
-    return heads
-
-
-def load_phase2_checkpoint(checkpoint_path: str, config: Dict, device: torch.device):
-    """Load trained Phase 2 models."""
-    print(f"Loading checkpoint from {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-
-    # Create models
-    tokenizer = create_tokenizer(config).to(device)
-    dynamics = create_dynamics_model(config).to(device)
-    heads = {k: v.to(device) for k, v in create_heads(config).items()}
-
-    # Load state dicts (handle compiled models with warnings)
-    tokenizer_sd = strip_compiled_prefix(checkpoint["tokenizer_state_dict"])
-    dynamics_sd = strip_compiled_prefix(checkpoint["dynamics_state_dict"])
-
-    load_state_dict_with_warnings(tokenizer, tokenizer_sd, "tokenizer")
-    load_state_dict_with_warnings(dynamics, dynamics_sd, "dynamics")
-    heads["policy"].load_state_dict(checkpoint["policy_state_dict"])
-    heads["value"].load_state_dict(checkpoint["value_state_dict"])
-    heads["reward"].load_state_dict(checkpoint["reward_state_dict"])
-
-    # Set to eval mode
-    tokenizer.eval()
-    dynamics.eval()
-    for head in heads.values():
-        head.eval()
-
-    print(f"  Checkpoint loaded successfully")
-    if "global_step" in checkpoint:
-        print(f"  Global step: {checkpoint['global_step']}")
-    if "epoch" in checkpoint:
-        print(f"  Epoch: {checkpoint['epoch']}")
-
-    return tokenizer, dynamics, heads, checkpoint
-
-
-@torch.inference_mode()  # Faster than no_grad for pure inference
-def evaluate_phase2(
+@torch.inference_mode()
+def evaluate_phase3(
     tokenizer: CausalTokenizer,
-    dynamics: DynamicsModel,
     heads: Dict[str, torch.nn.Module],
     dataloader,
     loss_fn: AgentFinetuningLoss,
     device: torch.device,
     num_batches: int = None,
-    quick: bool = False,  # Quick mode: skip detailed predictions
+    quick: bool = False,
 ) -> Dict:
-    """Evaluate Phase 2 model on dataset (inference only, no training)."""
-    print("\nEvaluating Phase 2 model (inference mode, no training)...")
+    """Evaluate Phase 3 model on dataset (inference only, no training).
+
+    Note: dynamics model is not needed for dataset evaluation since we use
+    real observations, not imagined rollouts.
+    """
+    print("\nEvaluating Phase 3 model (inference mode, no training)...")
     if quick:
         print("  Quick mode: Skipping detailed prediction collection")
     
@@ -160,7 +77,7 @@ def evaluate_phase2(
         if num_batches and batch_idx >= num_batches:
             break
         
-        # Move data to device (non_blocking for faster transfer)
+        # Move data to device
         frames = batch["frames"].to(device, non_blocking=True)
         actions = batch["actions"].to(device, non_blocking=True)
         rewards = batch["rewards"].to(device, non_blocking=True)
@@ -169,7 +86,7 @@ def evaluate_phase2(
         if frames.dim() == 5 and frames.shape[2] != tokenizer.in_channels:
             frames = frames.permute(0, 2, 1, 3, 4)
         
-        # Get latents from tokenizer (frozen, no gradients needed)
+        # Get latents from tokenizer
         tokenizer_output = tokenizer.encode(frames, mask_ratio=0.0)
         latents = tokenizer_output["latents"]  # (B, T, num_latent, latent_dim)
         
@@ -181,7 +98,7 @@ def evaluate_phase2(
         if actions.dim() == 3 and actions.shape[-1] == 1:
             actions = actions.squeeze(-1)
         
-        # Compute loss (this is just for metrics, not training)
+        # Compute loss (for metrics only, not training)
         loss_dict = loss_fn(
             policy_head=heads["policy"],
             reward_head=heads["reward"],
@@ -197,7 +114,7 @@ def evaluate_phase2(
         total_reward_loss += loss_dict["reward_loss"].item()
         total_bc_accuracy += loss_dict["bc_accuracy"]
         
-        # Compute reward prediction MSE (only if not in quick mode)
+        # Compute reward prediction MSE
         if not quick and "reward_predictions" in loss_dict and "reward_targets" in loss_dict:
             reward_preds = loss_dict["reward_predictions"]
             reward_targets = loss_dict["reward_targets"]
@@ -207,13 +124,12 @@ def evaluate_phase2(
             all_reward_preds.append(reward_preds.cpu().numpy())
             all_reward_targets.append(reward_targets.cpu().numpy())
         elif "reward_predictions" in loss_dict:
-            # Still compute MSE but don't store arrays
             reward_preds = loss_dict["reward_predictions"]
             reward_targets = loss_dict["reward_targets"]
             reward_mse = ((reward_preds - reward_targets) ** 2).mean().item()
             total_reward_mse += reward_mse
         
-        # Collect predictions for accuracy analysis (only if not in quick mode)
+        # Collect predictions for accuracy analysis
         if not quick and "policy_predictions" in loss_dict:
             preds = loss_dict["policy_predictions"].cpu().numpy()
             targets = actions.cpu().numpy()
@@ -255,7 +171,7 @@ def evaluate_phase2(
 def print_metrics(metrics: Dict):
     """Print evaluation metrics."""
     print("\n" + "="*60)
-    print("Phase 2 Evaluation Results")
+    print("Phase 3 Evaluation Results")
     print("="*60)
     print(f"\nOverall Metrics:")
     print(f"  Total Loss:        {metrics['loss']:.6f}")
@@ -280,7 +196,7 @@ def print_metrics(metrics: Dict):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate Phase 2 trained model")
+    parser = argparse.ArgumentParser(description="Evaluate Phase 3 trained model")
     parser.add_argument(
         "--config",
         type=str,
@@ -288,10 +204,16 @@ def main():
         help="Path to config file"
     )
     parser.add_argument(
-        "--checkpoint",
+        "--phase2-checkpoint",
         type=str,
         required=True,
-        help="Path to Phase 2 checkpoint"
+        help="Path to Phase 2 checkpoint (for tokenizer and dynamics)"
+    )
+    parser.add_argument(
+        "--phase3-checkpoint",
+        type=str,
+        required=True,
+        help="Path to Phase 3 checkpoint (for heads)"
     )
     parser.add_argument(
         "--data-path",
@@ -334,20 +256,25 @@ def main():
     
     print(f"Device: {device}")
     print(f"Config: {args.config}")
-    print(f"Checkpoint: {args.checkpoint}")
+    print(f"Phase 2 checkpoint: {args.phase2_checkpoint}")
+    print(f"Phase 3 checkpoint: {args.phase3_checkpoint}")
     
-    # Load checkpoint
-    tokenizer, dynamics, heads, checkpoint = load_phase2_checkpoint(
-        args.checkpoint, config, device
+    # Load Phase 2 checkpoint (world model)
+    tokenizer, dynamics, phase2_checkpoint = load_phase2_world_model(
+        args.phase2_checkpoint, config, device
+    )
+    
+    # Load Phase 3 checkpoint (heads)
+    heads, phase3_checkpoint = load_phase3_heads(
+        args.phase3_checkpoint, config, device
     )
     
     # Create data loader
     data_path = args.data_path or config["data"]["path"]
-    eval_batch_size = args.batch_size or min(config["data"]["batch_size"], 8)  # Smaller batch for faster eval
+    eval_batch_size = args.batch_size or min(config["data"]["batch_size"], 8)
     print(f"\nCreating data loader from: {data_path}")
     print(f"  Evaluation batch size: {eval_batch_size} (config: {config['data']['batch_size']})")
     
-    # Create dataset directly to avoid timeout issues with num_workers=0
     from dreamer.data.minerl_dataset import MineRLDataset
     from torch.utils.data import DataLoader
     
@@ -362,10 +289,10 @@ def main():
     eval_loader = DataLoader(
         eval_dataset,
         batch_size=eval_batch_size,
-        shuffle=False,  # No shuffle for evaluation
-        num_workers=0,  # Single process for faster startup
+        shuffle=False,
+        num_workers=0,
         pin_memory=True,
-        drop_last=False,  # Don't drop last batch for evaluation
+        drop_last=False,
     )
     print(f"  Total batches: {len(eval_loader)}")
     print(f"  Will evaluate: {args.num_batches} batches")
@@ -383,10 +310,9 @@ def main():
         use_mtp=use_mtp,
     )
     
-    # Evaluate
-    metrics = evaluate_phase2(
+    # Evaluate (dynamics not needed for dataset evaluation)
+    metrics = evaluate_phase3(
         tokenizer=tokenizer,
-        dynamics=dynamics,
         heads=heads,
         dataloader=eval_loader,
         loss_fn=loss_fn,

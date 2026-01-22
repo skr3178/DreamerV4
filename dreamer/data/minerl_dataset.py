@@ -32,6 +32,7 @@ class MineRLDataset(Dataset):
         split: str = "train",
         transform: Optional[callable] = None,
         max_episodes: Optional[int] = None,
+        use_multi_discrete: bool = False,  # If True, use multi-discrete format (keyboard binary + camera categorical)
     ):
         """
         Args:
@@ -50,6 +51,7 @@ class MineRLDataset(Dataset):
         self.split = split
         self.transform = transform
         self.max_episodes = max_episodes
+        self.use_multi_discrete = use_multi_discrete
         
         # Load episode metadata
         self.episodes = self._load_episodes()
@@ -212,8 +214,19 @@ class MineRLDataset(Dataset):
         
         raise ValueError("Unknown episode format")
     
-    def _load_action(self, episode: Dict, frame_idx: int) -> torch.Tensor:
-        """Load action for a frame."""
+    def _load_action(self, episode: Dict, frame_idx: int, use_multi_discrete: bool = False) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Load action for a frame.
+        
+        Args:
+            episode: Episode dictionary
+            frame_idx: Frame index
+            use_multi_discrete: If True, return multi-discrete format (keyboard binary + camera categorical)
+        
+        Returns:
+            If use_multi_discrete: Dict with 'keyboard' (8,) and 'camera' (1,)
+            Else: Single categorical action tensor
+        """
         if "data" in episode:
             data = episode["data"]
             if hasattr(data, "__getitem__"):
@@ -229,25 +242,45 @@ class MineRLDataset(Dataset):
                 # Path to actions.npz file
                 actions_dict = np.load(episode["actions"])
                 
-                # Combine all action components into single discrete action
-                from .action_utils import mineRL_actions_to_categorical
-                
-                try:
-                    # Convert to categorical action space
-                    categorical_actions = mineRL_actions_to_categorical(actions_dict)
-                    # Clamp frame_idx to action array bounds
-                    frame_idx = min(frame_idx, len(categorical_actions) - 1) if len(categorical_actions) > 0 else 0
-                    action_val = categorical_actions[frame_idx]
-                    return torch.tensor(action_val, dtype=torch.long)
-                except Exception as e:
-                    # Fallback: use first action component if combination fails
-                    print(f"Warning: Could not combine actions, using fallback: {e}")
-                    if len(actions_dict.keys()) > 0:
-                        first_key = list(actions_dict.keys())[0]
-                        action_array = actions_dict[first_key]
-                        frame_idx = min(frame_idx, len(action_array) - 1) if len(action_array) > 0 else 0
-                        action_val = action_array[frame_idx]
+                if use_multi_discrete:
+                    # Use multi-discrete format (keyboard binary + camera categorical)
+                    from .action_utils import mineRL_actions_to_multi_discrete
+                    
+                    try:
+                        multi_discrete = mineRL_actions_to_multi_discrete(actions_dict)
+                        # Clamp frame_idx to action array bounds
+                        frame_idx = min(frame_idx, len(multi_discrete["keyboard"]) - 1) if len(multi_discrete["keyboard"]) > 0 else 0
+                        return {
+                            "keyboard": torch.from_numpy(multi_discrete["keyboard"][frame_idx]).long(),
+                            "camera": torch.tensor(multi_discrete["camera"][frame_idx], dtype=torch.long),
+                        }
+                    except Exception as e:
+                        print(f"Warning: Could not convert to multi-discrete, using fallback: {e}")
+                        # Fallback to default
+                        return {
+                            "keyboard": torch.zeros(8, dtype=torch.long),
+                            "camera": torch.tensor(60, dtype=torch.long),  # Center bin
+                        }
+                else:
+                    # Combine all action components into single discrete action (backward compatibility)
+                    from .action_utils import mineRL_actions_to_categorical
+                    
+                    try:
+                        # Convert to categorical action space
+                        categorical_actions = mineRL_actions_to_categorical(actions_dict)
+                        # Clamp frame_idx to action array bounds
+                        frame_idx = min(frame_idx, len(categorical_actions) - 1) if len(categorical_actions) > 0 else 0
+                        action_val = categorical_actions[frame_idx]
                         return torch.tensor(action_val, dtype=torch.long)
+                    except Exception as e:
+                        # Fallback: use first action component if combination fails
+                        print(f"Warning: Could not combine actions, using fallback: {e}")
+                        if len(actions_dict.keys()) > 0:
+                            first_key = list(actions_dict.keys())[0]
+                            action_array = actions_dict[first_key]
+                            frame_idx = min(frame_idx, len(action_array) - 1) if len(action_array) > 0 else 0
+                            action_val = action_array[frame_idx]
+                            return torch.tensor(action_val, dtype=torch.long)
             elif episode["actions"] is not None:
                 # Already loaded numpy array
                 actions = episode["actions"]
@@ -256,6 +289,11 @@ class MineRLDataset(Dataset):
                 return torch.from_numpy(actions[frame_idx])
         
         # Default action (no-op)
+        if use_multi_discrete:
+            return {
+                "keyboard": torch.zeros(8, dtype=torch.long),
+                "camera": torch.tensor(60, dtype=torch.long),  # Center bin
+            }
         return torch.zeros(1, dtype=torch.long)
     
     def _load_reward(self, episode: Dict, frame_idx: int) -> torch.Tensor:
@@ -311,7 +349,7 @@ class MineRLDataset(Dataset):
             frame_idx = min(frame_idx, episode["length"] - 1)  # Clamp
             
             frame = self._load_frame(episode, frame_idx)
-            action = self._load_action(episode, frame_idx)
+            action = self._load_action(episode, frame_idx, use_multi_discrete=self.use_multi_discrete)
             reward = self._load_reward(episode, frame_idx)
             
             frames.append(frame)
@@ -321,8 +359,16 @@ class MineRLDataset(Dataset):
         # Stack into tensors
         frames = torch.stack(frames, dim=0)  # (T, ...)
         
-        # Handle actions - could be discrete or continuous
-        if actions[0].dim() == 0:
+        # Handle actions - could be discrete, continuous, or multi-discrete
+        if isinstance(actions[0], dict):
+            # Multi-discrete format
+            keyboard_actions = torch.stack([a["keyboard"] for a in actions], dim=0)  # (T, 8)
+            camera_actions = torch.stack([a["camera"] for a in actions], dim=0)  # (T,)
+            actions = {
+                "keyboard": keyboard_actions,
+                "camera": camera_actions,
+            }
+        elif actions[0].dim() == 0:
             actions = torch.stack(actions, dim=0)  # (T,)
         else:
             actions = torch.stack(actions, dim=0)  # (T, action_dim)
@@ -351,6 +397,7 @@ def create_dataloader(
     image_size: Tuple[int, int] = (64, 64),
     num_workers: int = 4,
     split: str = "train",
+    use_multi_discrete: bool = False,
     **kwargs,
 ) -> DataLoader:
     """
@@ -372,6 +419,7 @@ def create_dataloader(
         sequence_length=sequence_length,
         image_size=image_size,
         split=split,
+        use_multi_discrete=use_multi_discrete,
         **kwargs,
     )
     

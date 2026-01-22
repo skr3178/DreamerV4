@@ -85,11 +85,16 @@ def create_heads(config: Dict) -> Dict[str, nn.Module]:
     use_mtp = config["training"]["phase2"].get("use_mtp", True)
     mtp_length = config["training"]["phase2"].get("mtp_length", 8)
     
+    # Check action space type
+    action_space_type = config["dynamics"].get("action_space_type", "categorical")
+    use_multi_discrete = (action_space_type == "multi_discrete")
+    
     heads = {
         "policy": PolicyHead(
             input_dim=input_dim,
             hidden_dim=config["heads"]["hidden_dim"],
-            num_discrete_actions=config["dynamics"]["num_discrete_actions"],
+            num_discrete_actions=config["dynamics"]["num_discrete_actions"] if not use_multi_discrete else None,
+            use_multi_discrete=use_multi_discrete,
             num_layers=config["heads"]["num_layers"],
             mtp_length=mtp_length,
             use_mtp=use_mtp,
@@ -122,6 +127,7 @@ def train_agent_step(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     max_grad_norm: float = 1.0,
+    action_type: str = "discrete",
     debug: bool = False,
 ) -> Dict[str, float]:
     """Single training step for agent heads."""
@@ -162,7 +168,7 @@ def train_agent_step(
         latents=latents_flat,
         actions=actions,
         rewards=rewards,
-        action_type="discrete",
+        action_type=action_type,
     )
     
     loss = loss_dict["loss"]
@@ -251,6 +257,10 @@ def train_phase2(config: Dict, checkpoint_path: Optional[str] = None):
     
     # Create data loader
     print_flush("Creating data loader...")
+    # Check action space type for dataloader
+    action_space_type = config["dynamics"].get("action_space_type", "categorical")
+    use_multi_discrete = (action_space_type == "multi_discrete")
+    
     train_loader = create_dataloader(
         data_path=config["data"]["path"],
         batch_size=config["data"]["batch_size"],
@@ -258,6 +268,7 @@ def train_phase2(config: Dict, checkpoint_path: Optional[str] = None):
         image_size=(config["data"]["image_height"], config["data"]["image_width"]),
         num_workers=config["data"]["num_workers"],
         split="train",
+        use_multi_discrete=use_multi_discrete,
         max_episodes=config["data"].get("max_episodes", None),
     )
     print_flush(f"Data loader created: {len(train_loader)} batches, batch_size={config['data']['batch_size']}, num_workers={config['data']['num_workers']}")
@@ -372,6 +383,7 @@ def train_phase2(config: Dict, checkpoint_path: Optional[str] = None):
                 optimizer=optimizer,
                 device=device,
                 max_grad_norm=phase2_config["max_grad_norm"],
+                action_type="multi_discrete" if use_multi_discrete else "discrete",
                 debug=False,  # Disable debug to reduce overhead
             )
             

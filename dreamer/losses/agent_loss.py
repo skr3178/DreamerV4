@@ -514,7 +514,7 @@ class AgentFinetuningLoss(nn.Module):
             keyboard_logits = policy_output["keyboard_logits"]
             camera_logits = policy_output["camera_logits"]
             
-            # Keyboard BC loss (23 independent Bernoulli)
+            # Keyboard BC loss (8 independent Bernoulli)
             keyboard_dist = Independent(Bernoulli(logits=keyboard_logits), 1)
             keyboard_log_probs = keyboard_dist.log_prob(actions["keyboard"].float())
             keyboard_bc_loss = -keyboard_log_probs.mean()

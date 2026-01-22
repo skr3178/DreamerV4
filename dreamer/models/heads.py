@@ -10,7 +10,7 @@ These heads are trained during Phase 2 (Agent Finetuning) and Phase 3 (Imaginati
 while the main transformer remains frozen.
 """
 
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, Union
 
 import torch
 import torch.nn as nn
@@ -27,7 +27,10 @@ class PolicyHead(nn.Module):
     - MTP mode: Predicts L+1 future actions from a single embedding h_t (Multi-Token Prediction)
     
     Outputs action distribution conditioned on latent state.
-    Supports both discrete and continuous action spaces.
+    Supports:
+    - Discrete: Single categorical distribution
+    - Multi-discrete: Binary keyboard (8 independent Bernoulli) + Categorical camera (121 classes with foveated discretization)
+    - Continuous: Normal distribution
     """
     
     def __init__(
@@ -36,6 +39,7 @@ class PolicyHead(nn.Module):
         hidden_dim: int = 256,
         num_discrete_actions: Optional[int] = None,
         continuous_action_dim: Optional[int] = None,
+        use_multi_discrete: bool = False,  # If True: keyboard (8 binary) + camera (121 categorical)
         num_layers: int = 2,
         mtp_length: int = 8,
         use_mtp: bool = True,
@@ -44,8 +48,9 @@ class PolicyHead(nn.Module):
         Args:
             input_dim: Dimension of input latent representation
             hidden_dim: Hidden layer dimension
-            num_discrete_actions: Number of discrete actions (if discrete)
+            num_discrete_actions: Number of discrete actions (if discrete, single categorical)
             continuous_action_dim: Dimension of continuous actions (if continuous)
+            use_multi_discrete: If True, use multi-discrete format (8 binary keyboard + 121 categorical camera)
             num_layers: Number of hidden layers
             mtp_length: Length L for MTP (predicts n=0 to L, so L+1 timesteps per Equation 9)
             use_mtp: Whether to use Multi-Token Prediction mode (default True per paper)
@@ -55,6 +60,7 @@ class PolicyHead(nn.Module):
         self.input_dim = input_dim
         self.num_discrete_actions = num_discrete_actions
         self.continuous_action_dim = continuous_action_dim
+        self.use_multi_discrete = use_multi_discrete
         self.mtp_length = mtp_length
         self.use_mtp = use_mtp
         
@@ -72,7 +78,21 @@ class PolicyHead(nn.Module):
         self.mlp = nn.Sequential(*layers)
         
         # Output heads
-        if num_discrete_actions is not None:
+        if use_multi_discrete:
+            # Multi-discrete: 8 binary keyboard + 121 categorical camera
+            num_keyboard = 8
+            num_camera = 121  # 11×11 foveated discretization
+            
+            if use_mtp:
+                # MTP: predict L+1 timesteps from single h_t
+                self.keyboard_head = nn.Linear(hidden_dim, (mtp_length + 1) * num_keyboard)
+                self.camera_head = nn.Linear(hidden_dim, (mtp_length + 1) * num_camera)
+            else:
+                # Standard: predict single timestep
+                self.keyboard_head = nn.Linear(hidden_dim, num_keyboard)
+                self.camera_head = nn.Linear(hidden_dim, num_camera)
+        
+        elif num_discrete_actions is not None:
             if use_mtp:
                 # MTP: predict L+1 timesteps from single h_t
                 self.action_head = nn.Linear(hidden_dim, (mtp_length + 1) * num_discrete_actions)
@@ -103,9 +123,15 @@ class PolicyHead(nn.Module):
                 - MTP mode: (batch, input_dim) - single h_t embedding
         
         Returns:
-            Dictionary containing distribution parameters
-                - Standard mode: (batch, ..., num_actions)
-                - MTP mode: (batch, mtp_length+1, num_actions) - predictions for n=0 to L
+            Dictionary containing distribution parameters:
+                - Multi-discrete mode:
+                    - keyboard_logits: (batch, ..., 8) or (batch, mtp_length+1, 8)
+                    - camera_logits: (batch, ..., 121) or (batch, mtp_length+1, 121)
+                - Discrete mode:
+                    - logits: (batch, ..., num_actions) or (batch, mtp_length+1, num_actions)
+                    - probs: (batch, ..., num_actions) or (batch, mtp_length+1, num_actions)
+                - Continuous mode:
+                    - mean, std, log_std: (batch, ..., action_dim) or (batch, mtp_length+1, action_dim)
         """
         # Flatten if needed
         original_shape = latents.shape[:-1]
@@ -116,7 +142,26 @@ class PolicyHead(nn.Module):
         
         result = {}
         
-        if self.num_discrete_actions is not None:
+        if self.use_multi_discrete:
+            # Multi-discrete: keyboard (binary) + camera (categorical)
+            keyboard_logits = self.keyboard_head(hidden)
+            camera_logits = self.camera_head(hidden)
+            
+            if self.use_mtp:
+                # MTP: reshape to (batch, mtp_length+1, ...)
+                batch_size = keyboard_logits.shape[0]
+                keyboard_logits = keyboard_logits.reshape(batch_size, self.mtp_length + 1, 8)
+                camera_logits = camera_logits.reshape(batch_size, self.mtp_length + 1, 121)
+            else:
+                # Standard: reshape to original shape
+                keyboard_logits = keyboard_logits.reshape(*original_shape, 8)
+                camera_logits = camera_logits.reshape(*original_shape, 121)
+            
+            result["keyboard_logits"] = keyboard_logits
+            result["camera_logits"] = camera_logits
+            result["camera_probs"] = F.softmax(camera_logits, dim=-1)
+        
+        elif self.num_discrete_actions is not None:
             logits = self.action_head(hidden)
             
             if self.use_mtp:
@@ -155,7 +200,7 @@ class PolicyHead(nn.Module):
         self,
         latents: torch.Tensor,
         deterministic: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[Union[torch.Tensor, Dict[str, torch.Tensor]], torch.Tensor]:
         """
         Sample actions from the policy.
         
@@ -165,11 +210,42 @@ class PolicyHead(nn.Module):
         
         Returns:
             actions: Sampled actions
+                - Multi-discrete: Dict with 'keyboard' (batch, ..., 8) and 'camera' (batch, ...)
+                - Discrete: (batch, ...)
+                - Continuous: (batch, ..., action_dim)
             log_probs: Log probabilities of sampled actions
         """
         dist_params = self.forward(latents)
         
-        if self.num_discrete_actions is not None:
+        if self.use_multi_discrete:
+            from torch.distributions import Independent, Bernoulli, Categorical
+            
+            keyboard_logits = dist_params["keyboard_logits"]
+            camera_logits = dist_params["camera_logits"]
+            
+            # Sample keyboard (8 independent Bernoulli)
+            keyboard_dist = Independent(Bernoulli(logits=keyboard_logits), 1)
+            if deterministic:
+                keyboard_actions = (keyboard_logits > 0).long()
+            else:
+                keyboard_actions = keyboard_dist.sample().long()
+            keyboard_log_probs = keyboard_dist.log_prob(keyboard_actions.float())
+            
+            # Sample camera (categorical)
+            camera_dist = Categorical(logits=camera_logits)
+            if deterministic:
+                camera_actions = camera_logits.argmax(dim=-1)
+            else:
+                camera_actions = camera_dist.sample()
+            camera_log_probs = camera_dist.log_prob(camera_actions)
+            
+            actions = {
+                "keyboard": keyboard_actions,
+                "camera": camera_actions,
+            }
+            log_probs = keyboard_log_probs + camera_log_probs
+            
+        elif self.num_discrete_actions is not None:
             logits = dist_params["logits"]
             dist = Categorical(logits=logits)
             
@@ -197,7 +273,7 @@ class PolicyHead(nn.Module):
     def log_prob(
         self,
         latents: torch.Tensor,
-        actions: torch.Tensor,
+        actions: Union[torch.Tensor, Dict[str, torch.Tensor]],
     ) -> torch.Tensor:
         """
         Compute log probability of actions under the policy.
@@ -205,13 +281,32 @@ class PolicyHead(nn.Module):
         Args:
             latents: Latent representation
             actions: Actions to evaluate
+                - Multi-discrete: Dict with 'keyboard' and 'camera'
+                - Discrete: (batch, ...)
+                - Continuous: (batch, ..., action_dim)
         
         Returns:
             log_probs: Log probabilities
         """
         dist_params = self.forward(latents)
         
-        if self.num_discrete_actions is not None:
+        if self.use_multi_discrete:
+            from torch.distributions import Independent, Bernoulli, Categorical
+            
+            keyboard_logits = dist_params["keyboard_logits"]
+            camera_logits = dist_params["camera_logits"]
+            
+            # Keyboard log prob
+            keyboard_dist = Independent(Bernoulli(logits=keyboard_logits), 1)
+            keyboard_log_probs = keyboard_dist.log_prob(actions["keyboard"].float())
+            
+            # Camera log prob
+            camera_dist = Categorical(logits=camera_logits)
+            camera_log_probs = camera_dist.log_prob(actions["camera"])
+            
+            return keyboard_log_probs + camera_log_probs
+        
+        elif self.num_discrete_actions is not None:
             dist = Categorical(logits=dist_params["logits"])
             return dist.log_prob(actions)
         else:

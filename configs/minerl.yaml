@@ -41,8 +41,8 @@ dynamics:
   max_shortcut_steps: 6  # K in paper (2^K = 64 max steps)
   # MineRL action space (verified from actual dataset):
   # - 8 binary keyboard: forward, back, left, right, jump, sneak, sprint, attack
-  # - Camera: continuous 2D (pitch, yaw) → discretize to 121 classes (11×11 bins)
-  #   Range: [-89.40, 103.50] for pitch/yaw
+  # - Camera: continuous 2D (pitch, yaw) → discretize to 121 classes (11×11 bins) with foveated discretization
+  #   Range: [-150.0, 75.0] (based on actual dataset: pitch [-62.25, 60.60], yaw [-146.85, 69.75])
   # - 5 discrete string actions:
   #   * craft: 5 values (crafting_table, planks, stick, torch, none)
   #   * equip: 5 values (iron_pickaxe, stone_pickaxe, wooden_axe, wooden_pickaxe, none)
@@ -50,11 +50,13 @@ dynamics:
   #   * nearbySmelt: 2 values (iron_ingot, none)
   #   * place: 7 values (cobblestone, crafting_table, dirt, furnace, stone, torch, none)
   # Total discrete combinations: 5×5×6×2×7 = 2,100 (but typically only ~15-20 are used in practice)
-  # For DreamerV4: combine into single categorical space
-  # Strategy: 8 binary (as 8 separate) + 121 camera + ~15 most common discrete combinations = ~144
-  num_discrete_actions: 144  # 8 binary + 121 camera + 15 discrete combinations
-  # Alternative: use multi-discrete (8 binary + 121 categorical + others)
-  action_space_type: "categorical"  # "categorical" or "multi_discrete"
+  # For DreamerV4: use multi-discrete format (as per Training.md)
+  # - Keyboard: 8 binary distributions (independent Bernoulli)
+  # - Mouse/Camera: Categorical with foveated discretization (121 classes)
+  action_space_type: "multi_discrete"  # "categorical" or "multi_discrete"
+  # If categorical: combines into single 144-action space (backward compatibility)
+  # If multi_discrete: keyboard (8 binary) + camera (121 categorical)
+  num_discrete_actions: 144  # Only used if action_space_type == "categorical"
   num_registers: 4
 
 # Agent heads settings

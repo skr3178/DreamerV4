@@ -271,9 +271,9 @@ class ValueHead(nn.Module):
         # Precompute bin centers with symlog spacing
         if use_symlog:
             # Create bins in symlog space, then convert back
-            symlog_min = self._symlog(value_range[0])
-            symlog_max = self._symlog(value_range[1])
-            symlog_bin_centers = torch.linspace(symlog_min, symlog_max, num_bins)
+            symlog_min = self._symlog(torch.tensor(value_range[0]))
+            symlog_max = self._symlog(torch.tensor(value_range[1]))
+            symlog_bin_centers = torch.linspace(symlog_min.item(), symlog_max.item(), num_bins)
             bin_centers = self._symexp(symlog_bin_centers)
         else:
             # Linear spacing (backward compatibility)
@@ -339,9 +339,9 @@ class ValueHead(nn.Module):
         if self.use_symlog:
             # Convert to symlog space for binning
             symlog_target = self._symlog(target)
-            symlog_min = self._symlog(self.value_range[0])
-            symlog_max = self._symlog(self.value_range[1])
-            
+            symlog_min = self._symlog(torch.tensor(self.value_range[0], device=target.device))
+            symlog_max = self._symlog(torch.tensor(self.value_range[1], device=target.device))
+
             # Find bin indices in symlog space
             bin_width = (symlog_max - symlog_min) / (self.num_bins - 1)
             bin_idx = (symlog_target - symlog_min) / bin_width
@@ -349,18 +349,18 @@ class ValueHead(nn.Module):
             # Linear binning (backward compatibility)
             bin_width = (self.value_range[1] - self.value_range[0]) / (self.num_bins - 1)
             bin_idx = (target - self.value_range[0]) / bin_width
-        
+
         # Two-hot encoding
         lower_idx = bin_idx.floor().long().clamp(0, self.num_bins - 2)
         upper_idx = lower_idx + 1
         upper_weight = bin_idx - lower_idx.float()
         lower_weight = 1.0 - upper_weight
-        
+
         # Create target distribution
         target_dist = torch.zeros(*target.shape, self.num_bins, device=target.device)
         target_dist.scatter_(-1, lower_idx.unsqueeze(-1), lower_weight.unsqueeze(-1))
         target_dist.scatter_(-1, upper_idx.unsqueeze(-1), upper_weight.unsqueeze(-1))
-        
+
         return target_dist
 
 
@@ -430,15 +430,15 @@ class RewardHead(nn.Module):
         # Precompute bin centers with symlog spacing
         if use_symlog:
             # Create bins in symlog space, then convert back
-            symlog_min = self._symlog(reward_range[0])
-            symlog_max = self._symlog(reward_range[1])
-            symlog_bin_centers = torch.linspace(symlog_min, symlog_max, num_bins)
+            symlog_min = self._symlog(torch.tensor(reward_range[0]))
+            symlog_max = self._symlog(torch.tensor(reward_range[1]))
+            symlog_bin_centers = torch.linspace(symlog_min.item(), symlog_max.item(), num_bins)
             bin_centers = self._symexp(symlog_bin_centers)
         else:
             # Linear spacing (backward compatibility)
             bin_centers = torch.linspace(reward_range[0], reward_range[1], num_bins)
         self.register_buffer("bin_centers", bin_centers)
-    
+
     @staticmethod
     def _symlog(x: torch.Tensor) -> torch.Tensor:
         """Symmetric logarithm: sign(x) * ln(|x| + 1)"""
@@ -492,13 +492,13 @@ class RewardHead(nn.Module):
     def target_to_bins(self, target: torch.Tensor) -> torch.Tensor:
         """Convert target rewards to bin distribution targets."""
         target = target.clamp(self.reward_range[0], self.reward_range[1])
-        
+
         if self.use_symlog:
             # Convert to symlog space for binning
             symlog_target = self._symlog(target)
-            symlog_min = self._symlog(self.reward_range[0])
-            symlog_max = self._symlog(self.reward_range[1])
-            
+            symlog_min = self._symlog(torch.tensor(self.reward_range[0], device=target.device))
+            symlog_max = self._symlog(torch.tensor(self.reward_range[1], device=target.device))
+
             # Find bin indices in symlog space
             bin_width = (symlog_max - symlog_min) / (self.num_bins - 1)
             bin_idx = (symlog_target - symlog_min) / bin_width
@@ -506,14 +506,14 @@ class RewardHead(nn.Module):
             # Linear binning (backward compatibility)
             bin_width = (self.reward_range[1] - self.reward_range[0]) / (self.num_bins - 1)
             bin_idx = (target - self.reward_range[0]) / bin_width
-        
+
         lower_idx = bin_idx.floor().long().clamp(0, self.num_bins - 2)
         upper_idx = lower_idx + 1
         upper_weight = bin_idx - lower_idx.float()
         lower_weight = 1.0 - upper_weight
-        
+
         target_dist = torch.zeros(*target.shape, self.num_bins, device=target.device)
         target_dist.scatter_(-1, lower_idx.unsqueeze(-1), lower_weight.unsqueeze(-1))
         target_dist.scatter_(-1, upper_idx.unsqueeze(-1), upper_weight.unsqueeze(-1))
-        
+
         return target_dist

@@ -10,6 +10,7 @@ Phase 2 consists of:
 """
 
 import os
+import sys
 import argparse
 from pathlib import Path
 from typing import Dict, Optional
@@ -21,6 +22,13 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import yaml
+
+# Helper function for flushed printing (ensures output appears in log files immediately)
+def print_flush(*args, **kwargs):
+    """Print and immediately flush stdout and stderr."""
+    print(*args, **kwargs)
+    sys.stdout.flush()
+    sys.stderr.flush()
 
 from dreamer.models import CausalTokenizer, DynamicsModel
 from dreamer.models import PolicyHead, ValueHead, RewardHead
@@ -114,23 +122,30 @@ def train_agent_step(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     max_grad_norm: float = 1.0,
+    debug: bool = False,
 ) -> Dict[str, float]:
     """Single training step for agent heads."""
     optimizer.zero_grad()
     
     # Move data to device
-    frames = batch["frames"].to(device)
-    actions = batch["actions"].to(device)
-    rewards = batch["rewards"].to(device)
+    frames = batch["frames"].to(device, non_blocking=True)  # non_blocking for faster transfer
+    actions = batch["actions"].to(device, non_blocking=True)
+    rewards = batch["rewards"].to(device, non_blocking=True)
     
     # Reshape frames for tokenizer
     if frames.dim() == 5 and frames.shape[2] != tokenizer.in_channels:
         frames = frames.permute(0, 2, 1, 3, 4)
     
     # Get latents from tokenizer (no gradient - frozen)
+    # Use no_grad instead of inference_mode because latents need to be used in autograd
+    # (even though tokenizer is frozen, the latents need to be regular tensors for head training)
     with torch.no_grad():
         tokenizer_output = tokenizer.encode(frames, mask_ratio=0.0)
         latents = tokenizer_output["latents"]  # (B, T, num_latent, latent_dim)
+    
+    # Clone latents to make them regular tensors (not inference tensors)
+    # This allows them to be used in autograd for head training
+    latents = latents.clone()
     
     # Flatten latents for heads
     batch_size, time_steps, num_latent, latent_dim = latents.shape
@@ -179,6 +194,12 @@ def train_phase2(config: Dict, checkpoint_path: Optional[str] = None):
     device = torch.device(config["experiment"]["device"])
     set_seed(config["experiment"]["seed"])
     
+    # Enable optimizations for faster training
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True  # Faster convolutions
+        torch.backends.cudnn.deterministic = False  # Allow non-deterministic for speed
+        print_flush(f"CUDA optimizations enabled: cudnn.benchmark=True")
+    
     # Create directories
     log_dir = Path(config["experiment"]["log_dir"]) / f"{config['experiment']['name']}_phase2"
     ckpt_dir = Path(config["experiment"]["checkpoint_dir"]) / config["experiment"]["name"]
@@ -186,40 +207,50 @@ def train_phase2(config: Dict, checkpoint_path: Optional[str] = None):
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     
     # Create models
-    print("Creating models...")
+    print_flush("Creating models...")
     tokenizer = create_tokenizer(config).to(device)
     dynamics = create_dynamics_model(config).to(device)
     heads = {k: v.to(device) for k, v in create_heads(config).items()}
     
-    # Load Phase 1 checkpoint
+    # Load Phase 1 checkpoint BEFORE compiling (compilation changes state_dict keys)
     if checkpoint_path:
-        print(f"Loading Phase 1 checkpoint from {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+        print_flush(f"Loading Phase 1 checkpoint from {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
         tokenizer.load_state_dict(checkpoint["tokenizer_state_dict"])
         dynamics.load_state_dict(checkpoint["dynamics_state_dict"])
     else:
         # Try to find latest Phase 1 checkpoint
         phase1_ckpt = ckpt_dir / "phase1_final.pt"
         if phase1_ckpt.exists():
-            print(f"Loading Phase 1 checkpoint from {phase1_ckpt}")
-            checkpoint = torch.load(phase1_ckpt, map_location=device)
+            print_flush(f"Loading Phase 1 checkpoint from {phase1_ckpt}")
+            checkpoint = torch.load(phase1_ckpt, map_location=device, weights_only=False)
             tokenizer.load_state_dict(checkpoint["tokenizer_state_dict"])
             dynamics.load_state_dict(checkpoint["dynamics_state_dict"])
         else:
-            print("Warning: No Phase 1 checkpoint found, training from scratch")
+            print_flush("Warning: No Phase 1 checkpoint found, training from scratch")
+    
+    # Compile tokenizer for faster inference (AFTER loading checkpoint)
+    # This can speed up frozen tokenizer by 20-30%
+    try:
+        if hasattr(torch, 'compile') and device.type == "cuda":
+            print_flush("Compiling tokenizer for faster inference...")
+            tokenizer = torch.compile(tokenizer, mode="reduce-overhead")
+            print_flush("✓ Tokenizer compiled successfully")
+    except Exception as e:
+        print_flush(f"Warning: Could not compile tokenizer: {e} (continuing without compilation)")
     
     # Freeze transformers if specified
     if config["training"]["phase2"]["freeze_transformer"]:
-        print("Freezing tokenizer and dynamics transformers...")
+        print_flush("Freezing tokenizer and dynamics transformers...")
         freeze_module(tokenizer)
         freeze_module(dynamics)
     
     # Count parameters
     head_params = sum(count_parameters(h) for h in heads.values())
-    print(f"Trainable head parameters: {head_params:,}")
+    print_flush(f"Trainable head parameters: {head_params:,}")
     
     # Create data loader
-    print("Creating data loader...")
+    print_flush("Creating data loader...")
     train_loader = create_dataloader(
         data_path=config["data"]["path"],
         batch_size=config["data"]["batch_size"],
@@ -229,6 +260,9 @@ def train_phase2(config: Dict, checkpoint_path: Optional[str] = None):
         split="train",
         max_episodes=config["data"].get("max_episodes", None),
     )
+    print_flush(f"Data loader created: {len(train_loader)} batches, batch_size={config['data']['batch_size']}, num_workers={config['data']['num_workers']}")
+    sys.stdout.flush()
+    sys.stderr.flush()
     
     # Create loss function
     # MTP configuration (default: True to match paper Equation 9)
@@ -269,24 +303,66 @@ def train_phase2(config: Dict, checkpoint_path: Optional[str] = None):
     
     # Tensorboard
     writer = SummaryWriter(log_dir)
+    print_flush(f"Tensorboard log directory: {log_dir}")
+    sys.stdout.flush()
+    sys.stderr.flush()
     
     # Training loop
-    print("Starting Phase 2 training...")
+    print_flush("Starting Phase 2 training...")
+    max_steps = phase2_config.get("max_steps", None)
+    if max_steps:
+        print_flush(f"Max steps: {max_steps} (will stop early if reached)")
+    print_flush(f"Logging every {config['logging']['log_every']} steps")
+    print_flush(f"Total batches per epoch: {len(train_loader)}")
+    print_flush(f"Total epochs: {phase2_config['epochs']}")
+    print_flush("")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    
     global_step = 0
     
     tokenizer.eval()  # Keep in eval mode
     dynamics.eval()
+    print_flush("Models set to eval mode (tokenizer, dynamics) and train mode (heads)")
+    sys.stdout.flush()
+    sys.stderr.flush()
     
     for epoch in range(phase2_config["epochs"]):
+        print_flush(f"\n{'='*60}")
+        print_flush(f"Starting Epoch {epoch+1}/{phase2_config['epochs']}")
+        print_flush(f"{'='*60}")
+        sys.stdout.flush()
+        sys.stderr.flush()
+        
         for head in heads.values():
             head.train()
         
         epoch_losses = []
         epoch_accuracies = []
         
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{phase2_config['epochs']}")
+        print_flush(f"Entering training loop for epoch {epoch+1}...")
+        sys.stdout.flush()
+        sys.stderr.flush()
         
+        # Configure tqdm to flush output immediately
+        pbar = tqdm(
+            train_loader, 
+            desc=f"Epoch {epoch+1}/{phase2_config['epochs']}",
+            file=sys.stdout,  # Explicitly use stdout
+            mininterval=0.5,  # Update more frequently (every 0.5 seconds)
+            maxinterval=2.0,  # Force update every 2 seconds max
+        )
+        
+        batch_idx = 0
         for batch in pbar:
+            batch_idx += 1
+            
+            # Log first batch info
+            if batch_idx == 1:
+                print_flush(f"✓ First batch received! Shapes: frames={batch['frames'].shape}, actions={batch['actions'].shape}, rewards={batch['rewards'].shape}")
+                sys.stdout.flush()
+                sys.stderr.flush()
+            
             loss_dict = train_agent_step(
                 tokenizer=tokenizer,
                 dynamics=dynamics,
@@ -296,6 +372,7 @@ def train_phase2(config: Dict, checkpoint_path: Optional[str] = None):
                 optimizer=optimizer,
                 device=device,
                 max_grad_norm=phase2_config["max_grad_norm"],
+                debug=False,  # Disable debug to reduce overhead
             )
             
             epoch_losses.append(loss_dict["loss"])
@@ -308,6 +385,28 @@ def train_phase2(config: Dict, checkpoint_path: Optional[str] = None):
                 "loss": f"{loss_dict['loss']:.4f}",
                 "acc": f"{loss_dict['bc_accuracy']:.2%}",
             })
+            # Flush progress bar output
+            pbar.refresh()
+            sys.stdout.flush()
+            sys.stderr.flush()
+            
+            # Save checkpoint periodically during training (for max_steps scenarios)
+            save_every_steps = phase2_config.get("save_every_steps", None)
+            if save_every_steps and global_step % save_every_steps == 0:
+                checkpoint = {
+                    "epoch": epoch,
+                    "global_step": global_step,
+                    "tokenizer_state_dict": tokenizer.state_dict(),
+                    "dynamics_state_dict": dynamics.state_dict(),
+                    "policy_state_dict": heads["policy"].state_dict(),
+                    "value_state_dict": heads["value"].state_dict(),
+                    "reward_state_dict": heads["reward"].state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "config": config,
+                }
+                step_checkpoint_path = ckpt_dir / f"phase2_step_{global_step}.pt"
+                torch.save(checkpoint, step_checkpoint_path)
+                print_flush(f"Saved checkpoint at step {global_step} to {step_checkpoint_path}")
             
             # Log to tensorboard
             if global_step % config["logging"]["log_every"] == 0:
@@ -324,15 +423,44 @@ def train_phase2(config: Dict, checkpoint_path: Optional[str] = None):
                     writer.add_scalar("rewards/pred_std", loss_dict["pred_std"], global_step)
                     # Warning if reward head collapses
                     if loss_dict["pred_std"] < 0.01:
-                        print(f"WARNING [Step {global_step}]: Reward head may have collapsed (std={loss_dict['pred_std']:.4f})")
+                        print_flush(f"WARNING [Step {global_step}]: Reward head may have collapsed (std={loss_dict['pred_std']:.4f})")
+                
+                # Flush after logging
+                writer.flush()
+                sys.stdout.flush()
+                sys.stderr.flush()
             
             global_step += 1
+            
+            # Check if we've reached max_steps
+            if max_steps and global_step >= max_steps:
+                print_flush(f"\nReached max_steps ({max_steps}), stopping training early...")
+                # Save final checkpoint before stopping
+                final_checkpoint = {
+                    "epoch": epoch,
+                    "global_step": global_step,
+                    "tokenizer_state_dict": tokenizer.state_dict(),
+                    "dynamics_state_dict": dynamics.state_dict(),
+                    "policy_state_dict": heads["policy"].state_dict(),
+                    "value_state_dict": heads["value"].state_dict(),
+                    "reward_state_dict": heads["reward"].state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "config": config,
+                }
+                final_step_path = ckpt_dir / f"phase2_step_{global_step}_final.pt"
+                torch.save(final_checkpoint, final_step_path)
+                print_flush(f"Saved final checkpoint at step {global_step} to {final_step_path}")
+                break
+        
+        # Check if we should break out of epoch loop
+        if max_steps and global_step >= max_steps:
+            break
         
         # Epoch summary
         avg_loss = sum(epoch_losses) / len(epoch_losses)
         avg_acc = sum(epoch_accuracies) / len(epoch_accuracies)
         
-        print(f"Epoch {epoch+1}: Loss = {avg_loss:.4f}, Accuracy = {avg_acc:.2%}")
+        print_flush(f"Epoch {epoch+1}: Loss = {avg_loss:.4f}, Accuracy = {avg_acc:.2%}")
         
         writer.add_scalar("epoch/loss", avg_loss, epoch)
         writer.add_scalar("epoch/accuracy", avg_acc, epoch)
@@ -350,23 +478,25 @@ def train_phase2(config: Dict, checkpoint_path: Optional[str] = None):
                 "config": config,
             }
             torch.save(checkpoint, ckpt_dir / f"phase2_epoch_{epoch+1}.pt")
-            print(f"Saved checkpoint to {ckpt_dir / f'phase2_epoch_{epoch+1}.pt'}")
+            print_flush(f"Saved checkpoint to {ckpt_dir / f'phase2_epoch_{epoch+1}.pt'}")
     
     # Save final checkpoint
     final_checkpoint = {
-        "epoch": phase2_config["epochs"],
+        "epoch": epoch if max_steps and global_step >= max_steps else phase2_config["epochs"],
+        "global_step": global_step,
         "tokenizer_state_dict": tokenizer.state_dict(),
         "dynamics_state_dict": dynamics.state_dict(),
         "policy_state_dict": heads["policy"].state_dict(),
         "value_state_dict": heads["value"].state_dict(),
         "reward_state_dict": heads["reward"].state_dict(),
+        "optimizer": optimizer.state_dict(),
         "config": config,
     }
     torch.save(final_checkpoint, ckpt_dir / "phase2_final.pt")
-    print(f"Saved final checkpoint to {ckpt_dir / 'phase2_final.pt'}")
+    print_flush(f"Saved final checkpoint (step {global_step}) to {ckpt_dir / 'phase2_final.pt'}")
     
     writer.close()
-    print("Phase 2 training complete!")
+    print_flush("Phase 2 training complete!")
 
 
 def main():

@@ -9,6 +9,7 @@ Phase 1 consists of:
 """
 
 import os
+import sys
 import argparse
 from pathlib import Path
 from typing import Dict, Optional
@@ -20,6 +21,13 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import yaml
+
+# Helper function for flushed printing (ensures output appears in log files immediately)
+def print_flush(*args, **kwargs):
+    """Print and immediately flush stdout and stderr."""
+    print(*args, **kwargs)
+    sys.stdout.flush()
+    sys.stderr.flush()
 
 from dreamer.models import CausalTokenizer, DynamicsModel
 from dreamer.losses import TokenizerLoss, ShortcutForcingLoss
@@ -176,7 +184,27 @@ def train_phase1(config: Dict):
     2. Train dynamics with shortcut forcing
     """
     # Setup
-    device = torch.device(config["experiment"]["device"])
+    requested_device = config["experiment"]["device"]
+    # Check CUDA availability and fallback to CPU if needed
+    if requested_device == "cuda" and not torch.cuda.is_available():
+        print_flush("⚠️  Warning: CUDA requested but not available. Falling back to CPU.")
+        device = torch.device("cpu")
+    else:
+        device = torch.device(requested_device)
+    
+    print_flush(f"Using device: {device}")
+    if device.type == "cuda":
+        print_flush(f"  GPU: {torch.cuda.get_device_name(0)}")
+        print_flush(f"  CUDA version: {torch.version.cuda}")
+        # Clear any leftover GPU memory
+        torch.cuda.empty_cache()
+        memory_allocated = torch.cuda.memory_allocated(0) / 1024**2
+        memory_reserved = torch.cuda.memory_reserved(0) / 1024**2
+        if memory_allocated > 0 or memory_reserved > 0:
+            print_flush(f"  Warning: GPU memory already in use: {memory_allocated:.2f} MB allocated, {memory_reserved:.2f} MB reserved")
+            print_flush(f"  Clearing cache...")
+            torch.cuda.empty_cache()
+    
     set_seed(config["experiment"]["seed"])
     
     # Create directories
@@ -186,15 +214,21 @@ def train_phase1(config: Dict):
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     
     # Create models
-    print("Creating models...")
+    print_flush("Creating models...")
     tokenizer = create_tokenizer(config).to(device)
     dynamics = create_dynamics_model(config).to(device)
     
-    print(f"Tokenizer parameters: {count_parameters(tokenizer):,}")
-    print(f"Dynamics parameters: {count_parameters(dynamics):,}")
+    # Verify models are on correct device
+    tokenizer_device = next(tokenizer.parameters()).device
+    dynamics_device = next(dynamics.parameters()).device
+    print_flush(f"Tokenizer device: {tokenizer_device}")
+    print_flush(f"Dynamics device: {dynamics_device}")
+    
+    print_flush(f"Tokenizer parameters: {count_parameters(tokenizer):,}")
+    print_flush(f"Dynamics parameters: {count_parameters(dynamics):,}")
     
     # Create data loader
-    print("Creating data loader...")
+    print_flush("Creating data loader...")
     train_loader = create_dataloader(
         data_path=config["data"]["path"],
         batch_size=config["data"]["batch_size"],
@@ -206,11 +240,30 @@ def train_phase1(config: Dict):
     )
     
     # Create losses
+    use_lpips = config["training"]["phase1"].get("use_lpips", True)
     tokenizer_loss_fn = TokenizerLoss(
         lpips_weight=config["training"]["phase1"]["lpips_weight"],
-        use_lpips=True,
+        use_lpips=use_lpips,
     )
+    # Move LPIPS to device if available
+    if hasattr(tokenizer_loss_fn, 'lpips_fn') and tokenizer_loss_fn.lpips_fn is not None:
+        tokenizer_loss_fn.lpips_fn = tokenizer_loss_fn.lpips_fn.to(device)
+        print_flush("LPIPS model moved to device")
+    elif not use_lpips:
+        print_flush("LPIPS disabled for faster training")
+    
     dynamics_loss_fn = ShortcutForcingLoss()
+    
+    # Print training configuration
+    print_flush(f"\nTraining Configuration:")
+    print_flush(f"  Batch size: {config['data']['batch_size']}")
+    print_flush(f"  Num workers: {config['data']['num_workers']}")
+    print_flush(f"  Sequence length: {config['data']['sequence_length']}")
+    print_flush(f"  LPIPS enabled: {use_lpips}")
+    print_flush(f"  Device: {device}")
+    if device.type == "cuda":
+        print_flush(f"  GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+    print_flush()
     
     # Create optimizers
     phase1_config = config["training"]["phase1"]
@@ -248,18 +301,46 @@ def train_phase1(config: Dict):
     writer = SummaryWriter(log_dir)
     
     # Training loop
-    print("Starting Phase 1 training...")
+    print_flush("Starting Phase 1 training...")
+    print_flush(f"Total batches per epoch: {len(train_loader)}")
+    max_steps = phase1_config.get("max_steps", None)
+    if max_steps:
+        print_flush(f"Max steps: {max_steps} (will stop early if reached)")
+    print_flush(f"Logging every {config['logging']['log_every']} steps\n")
     global_step = 0
     
     for epoch in range(phase1_config["epochs"]):
         tokenizer.train()
         dynamics.train()
         
-        epoch_losses = {"tokenizer": [], "dynamics": []}
+        # Track all loss components
+        epoch_losses = {
+            "tokenizer": {
+                "total": [],
+                "mse": [],
+                "lpips": [],
+                "mse_norm": [],
+                "lpips_norm": [],
+            },
+            "dynamics": {
+                "total": [],
+                "d_min": [],
+                "d_other": [],
+                "mean_weight": [],
+                "mean_signal": [],
+                "mean_step": [],
+            }
+        }
         
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{phase1_config['epochs']}")
+        # Configure tqdm to flush output immediately
+        pbar = tqdm(
+            train_loader, 
+            desc=f"Epoch {epoch+1}/{phase1_config['epochs']}",
+            file=sys.stdout,  # Explicitly use stdout
+            mininterval=1.0,  # Update at least every second
+        )
         
-        for batch in pbar:
+        for batch_idx, batch in enumerate(pbar):
             # Train tokenizer
             tok_loss = train_tokenizer_step(
                 tokenizer=tokenizer,
@@ -269,8 +350,16 @@ def train_phase1(config: Dict):
                 device=device,
                 max_grad_norm=phase1_config["max_grad_norm"],
             )
-            epoch_losses["tokenizer"].append(tok_loss["loss"])
+            
+            # Track tokenizer losses
+            epoch_losses["tokenizer"]["total"].append(tok_loss["loss"])
+            epoch_losses["tokenizer"]["mse"].append(tok_loss.get("mse_loss", 0.0))
+            epoch_losses["tokenizer"]["lpips"].append(tok_loss.get("lpips_loss", 0.0))
+            epoch_losses["tokenizer"]["mse_norm"].append(tok_loss.get("mse_loss_normalized", 0.0))
+            epoch_losses["tokenizer"]["lpips_norm"].append(tok_loss.get("lpips_loss_normalized", 0.0))
+            
             tokenizer_scheduler.step()
+            tok_lr = tokenizer_scheduler.get_last_lr()[0]
             
             # Train dynamics
             dyn_loss = train_dynamics_step(
@@ -282,31 +371,152 @@ def train_phase1(config: Dict):
                 device=device,
                 max_grad_norm=phase1_config["max_grad_norm"],
             )
-            epoch_losses["dynamics"].append(dyn_loss["loss"])
-            dynamics_scheduler.step()
             
-            # Update progress bar
+            # Track dynamics losses
+            epoch_losses["dynamics"]["total"].append(dyn_loss["loss"])
+            epoch_losses["dynamics"]["d_min"].append(dyn_loss.get("d_min_loss", 0.0))
+            epoch_losses["dynamics"]["d_other"].append(dyn_loss.get("d_other_loss", 0.0))
+            epoch_losses["dynamics"]["mean_weight"].append(dyn_loss.get("mean_weight", 0.0))
+            epoch_losses["dynamics"]["mean_signal"].append(dyn_loss.get("mean_signal_level", 0.0))
+            epoch_losses["dynamics"]["mean_step"].append(dyn_loss.get("mean_step_size", 0.0))
+            
+            dynamics_scheduler.step()
+            dyn_lr = dynamics_scheduler.get_last_lr()[0]
+            
+            # Update progress bar with detailed metrics
             pbar.set_postfix({
-                "tok_loss": f"{tok_loss['loss']:.4f}",
-                "dyn_loss": f"{dyn_loss['loss']:.4f}",
+                "tok": f"{tok_loss['loss']:.4f}",
+                "tok_mse": f"{tok_loss.get('mse_loss', 0.0):.4f}",
+                "tok_lpips": f"{tok_loss.get('lpips_loss', 0.0):.4f}",
+                "dyn": f"{dyn_loss['loss']:.4f}",
+                "d_min": f"{dyn_loss.get('d_min_loss', 0.0):.4f}",
+                "d_other": f"{dyn_loss.get('d_other_loss', 0.0):.4f}",
+                "lr_tok": f"{tok_lr:.2e}",
+                "lr_dyn": f"{dyn_lr:.2e}",
             })
+            # Flush progress bar output
+            pbar.refresh()
+            sys.stdout.flush()
+            sys.stderr.flush()
             
             # Log to tensorboard
             if global_step % config["logging"]["log_every"] == 0:
-                writer.add_scalar("loss/tokenizer", tok_loss["loss"], global_step)
-                writer.add_scalar("loss/dynamics", dyn_loss["loss"], global_step)
-                writer.add_scalar("lr/tokenizer", tokenizer_scheduler.get_last_lr()[0], global_step)
+                # Tokenizer losses
+                writer.add_scalar("loss/tokenizer/total", tok_loss["loss"], global_step)
+                writer.add_scalar("loss/tokenizer/mse", tok_loss.get("mse_loss", 0.0), global_step)
+                writer.add_scalar("loss/tokenizer/lpips", tok_loss.get("lpips_loss", 0.0), global_step)
+                writer.add_scalar("loss/tokenizer/mse_normalized", tok_loss.get("mse_loss_normalized", 0.0), global_step)
+                writer.add_scalar("loss/tokenizer/lpips_normalized", tok_loss.get("lpips_loss_normalized", 0.0), global_step)
+                
+                # Dynamics losses
+                writer.add_scalar("loss/dynamics/total", dyn_loss["loss"], global_step)
+                writer.add_scalar("loss/dynamics/d_min", dyn_loss.get("d_min_loss", 0.0), global_step)
+                writer.add_scalar("loss/dynamics/d_other", dyn_loss.get("d_other_loss", 0.0), global_step)
+                writer.add_scalar("loss/dynamics/mean_weight", dyn_loss.get("mean_weight", 0.0), global_step)
+                writer.add_scalar("loss/dynamics/mean_signal_level", dyn_loss.get("mean_signal_level", 0.0), global_step)
+                writer.add_scalar("loss/dynamics/mean_step_size", dyn_loss.get("mean_step_size", 0.0), global_step)
+                
+                # Learning rates
+                writer.add_scalar("lr/tokenizer", tok_lr, global_step)
+                writer.add_scalar("lr/dynamics", dyn_lr, global_step)
+                
+                # Flush after logging
+                writer.flush()
+                sys.stdout.flush()
+                sys.stderr.flush()
             
             global_step += 1
+            
+            # Save checkpoint periodically during training (for max_steps scenarios)
+            save_every_steps = phase1_config.get("save_every_steps", None)
+            if save_every_steps and global_step % save_every_steps == 0:
+                checkpoint = {
+                    "epoch": epoch,
+                    "global_step": global_step,
+                    "tokenizer_state_dict": tokenizer.state_dict(),
+                    "dynamics_state_dict": dynamics.state_dict(),
+                    "tokenizer_optimizer": tokenizer_optimizer.state_dict(),
+                    "dynamics_optimizer": dynamics_optimizer.state_dict(),
+                    "config": config,
+                }
+                step_checkpoint_path = ckpt_dir / f"phase1_step_{global_step}.pt"
+                torch.save(checkpoint, step_checkpoint_path)
+                print_flush(f"Saved checkpoint at step {global_step} to {step_checkpoint_path}")
+            
+            # Check if we've reached max_steps
+            if max_steps and global_step >= max_steps:
+                print_flush(f"\nReached max_steps ({max_steps}), stopping training early...")
+                # Save final checkpoint before stopping
+                final_checkpoint = {
+                    "epoch": epoch,
+                    "global_step": global_step,
+                    "tokenizer_state_dict": tokenizer.state_dict(),
+                    "dynamics_state_dict": dynamics.state_dict(),
+                    "tokenizer_optimizer": tokenizer_optimizer.state_dict(),
+                    "dynamics_optimizer": dynamics_optimizer.state_dict(),
+                    "config": config,
+                }
+                final_step_path = ckpt_dir / f"phase1_step_{global_step}_final.pt"
+                torch.save(final_checkpoint, final_step_path)
+                print_flush(f"Saved final checkpoint at step {global_step} to {final_step_path}")
+                break
         
-        # Epoch summary
-        avg_tok_loss = sum(epoch_losses["tokenizer"]) / len(epoch_losses["tokenizer"])
-        avg_dyn_loss = sum(epoch_losses["dynamics"]) / len(epoch_losses["dynamics"])
+        # Check if we should break out of epoch loop
+        if max_steps and global_step >= max_steps:
+            break
         
-        print(f"Epoch {epoch+1}: Tokenizer Loss = {avg_tok_loss:.4f}, Dynamics Loss = {avg_dyn_loss:.4f}")
+        # Compute epoch averages
+        def avg(lst):
+            return sum(lst) / len(lst) if lst else 0.0
         
-        writer.add_scalar("epoch/tokenizer_loss", avg_tok_loss, epoch)
-        writer.add_scalar("epoch/dynamics_loss", avg_dyn_loss, epoch)
+        avg_tok_total = avg(epoch_losses["tokenizer"]["total"])
+        avg_tok_mse = avg(epoch_losses["tokenizer"]["mse"])
+        avg_tok_lpips = avg(epoch_losses["tokenizer"]["lpips"])
+        avg_tok_mse_norm = avg(epoch_losses["tokenizer"]["mse_norm"])
+        avg_tok_lpips_norm = avg(epoch_losses["tokenizer"]["lpips_norm"])
+        
+        avg_dyn_total = avg(epoch_losses["dynamics"]["total"])
+        avg_dyn_d_min = avg(epoch_losses["dynamics"]["d_min"])
+        avg_dyn_d_other = avg(epoch_losses["dynamics"]["d_other"])
+        avg_dyn_weight = avg(epoch_losses["dynamics"]["mean_weight"])
+        avg_dyn_signal = avg(epoch_losses["dynamics"]["mean_signal"])
+        avg_dyn_step = avg(epoch_losses["dynamics"]["mean_step"])
+        
+        # Detailed epoch summary
+        print_flush(f"\n{'='*80}")
+        print_flush(f"Epoch {epoch+1}/{phase1_config['epochs']} Summary")
+        print_flush(f"{'='*80}")
+        print_flush(f"Tokenizer Losses:")
+        print_flush(f"  Total:        {avg_tok_total:.6f}")
+        print_flush(f"  MSE:          {avg_tok_mse:.6f}")
+        print_flush(f"  LPIPS:        {avg_tok_lpips:.6f}")
+        print_flush(f"  MSE (norm):   {avg_tok_mse_norm:.6f}")
+        print_flush(f"  LPIPS (norm): {avg_tok_lpips_norm:.6f}")
+        print_flush(f"  Learning Rate: {tok_lr:.2e}")
+        print_flush(f"\nDynamics Losses:")
+        print_flush(f"  Total:        {avg_dyn_total:.6f}")
+        print_flush(f"  d_min:        {avg_dyn_d_min:.6f}")
+        print_flush(f"  d_other:      {avg_dyn_d_other:.6f}")
+        print_flush(f"  Mean Weight:  {avg_dyn_weight:.6f}")
+        print_flush(f"  Mean Signal:  {avg_dyn_signal:.6f}")
+        print_flush(f"  Mean Step:    {avg_dyn_step:.6f}")
+        print_flush(f"  Learning Rate: {dyn_lr:.2e}")
+        print_flush(f"{'='*80}\n")
+        
+        # Log epoch averages to tensorboard
+        writer.add_scalar("epoch/tokenizer/total", avg_tok_total, epoch)
+        writer.add_scalar("epoch/tokenizer/mse", avg_tok_mse, epoch)
+        writer.add_scalar("epoch/tokenizer/lpips", avg_tok_lpips, epoch)
+        writer.add_scalar("epoch/tokenizer/mse_normalized", avg_tok_mse_norm, epoch)
+        writer.add_scalar("epoch/tokenizer/lpips_normalized", avg_tok_lpips_norm, epoch)
+        writer.add_scalar("epoch/dynamics/total", avg_dyn_total, epoch)
+        writer.add_scalar("epoch/dynamics/d_min", avg_dyn_d_min, epoch)
+        writer.add_scalar("epoch/dynamics/d_other", avg_dyn_d_other, epoch)
+        writer.add_scalar("epoch/dynamics/mean_weight", avg_dyn_weight, epoch)
+        writer.add_scalar("epoch/dynamics/mean_signal_level", avg_dyn_signal, epoch)
+        writer.add_scalar("epoch/dynamics/mean_step_size", avg_dyn_step, epoch)
+        writer.add_scalar("epoch/lr/tokenizer", tok_lr, epoch)
+        writer.add_scalar("epoch/lr/dynamics", dyn_lr, epoch)
         
         # Save checkpoint
         if (epoch + 1) % phase1_config["save_every"] == 0:
@@ -319,20 +529,23 @@ def train_phase1(config: Dict):
                 "config": config,
             }
             torch.save(checkpoint, ckpt_dir / f"phase1_epoch_{epoch+1}.pt")
-            print(f"Saved checkpoint to {ckpt_dir / f'phase1_epoch_{epoch+1}.pt'}")
+            print_flush(f"Saved checkpoint to {ckpt_dir / f'phase1_epoch_{epoch+1}.pt'}")
     
     # Save final checkpoint
     final_checkpoint = {
-        "epoch": phase1_config["epochs"],
+        "epoch": epoch if max_steps and global_step >= max_steps else phase1_config["epochs"],
+        "global_step": global_step,
         "tokenizer_state_dict": tokenizer.state_dict(),
         "dynamics_state_dict": dynamics.state_dict(),
+        "tokenizer_optimizer": tokenizer_optimizer.state_dict(),
+        "dynamics_optimizer": dynamics_optimizer.state_dict(),
         "config": config,
     }
     torch.save(final_checkpoint, ckpt_dir / "phase1_final.pt")
-    print(f"Saved final checkpoint to {ckpt_dir / 'phase1_final.pt'}")
+    print_flush(f"Saved final checkpoint (step {global_step}) to {ckpt_dir / 'phase1_final.pt'}")
     
     writer.close()
-    print("Phase 1 training complete!")
+    print_flush("Phase 1 training complete!")
 
 
 def main():

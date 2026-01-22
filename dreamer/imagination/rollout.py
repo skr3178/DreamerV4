@@ -167,29 +167,37 @@ class ImaginationRollout(nn.Module):
         for t in range(self.horizon):
             # Store current latent
             latents_list.append(current_latent)
-            
+
             # Flatten latent for heads
             flat_latent = self.flatten_latents(current_latent)
-            
+
             # Predict value at current state
             value_out = self.value_head(flat_latent)
             values_list.append(value_out["value"])
-            
+
             # Sample action from policy
             action, log_prob = self.policy_head.sample(
                 flat_latent, deterministic=deterministic
             )
+            # Handle MTP-mode policy: take only the first prediction (n=0)
+            if action.dim() > 1:
+                action = action[:, 0]
+                log_prob = log_prob[:, 0]
             actions_list.append(action)
             log_probs_list.append(log_prob)
-            
+
             # Generate next latent state
             with torch.no_grad():
                 next_latent = self.generate_step(current_latent, action)
-            
+
             # Predict reward for transition
             flat_next_latent = self.flatten_latents(next_latent)
             reward_out = self.reward_head(flat_next_latent)
-            rewards_list.append(reward_out["reward"])
+            reward = reward_out["reward"]
+            # Handle MTP-mode reward head: take only the first prediction (n=0)
+            if reward.dim() > 1:
+                reward = reward[:, 0]
+            rewards_list.append(reward)
             
             # Move to next state
             current_latent = next_latent

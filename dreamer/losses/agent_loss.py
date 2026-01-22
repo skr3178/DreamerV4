@@ -328,17 +328,36 @@ class AgentFinetuningLoss(nn.Module):
                 # Fallback: use MSE on latents directly
                 return F.mse_loss(latents_reshaped, latents_reshaped.detach())
         
-        # Reconstruct patches from latents
-        # This is a simplified version - in practice, we'd use the full tokenizer decoder
-        # For now, we'll compute a proxy loss on the latent representations
-        # The actual reconstruction would require the full decoder path
+        # Reconstruct frames from latents using tokenizer decoder
+        # Decode each timestep's latents to frames
+        reconstructed_frames = []
+        for t in range(time_steps):
+            frame_latents = latents_reshaped[:, t]  # (batch, num_latent, latent_dim)
+            # Use tokenizer's decode method to reconstruct frames
+            if hasattr(tokenizer, 'decode'):
+                reconstructed_frame = tokenizer.decode(frame_latents)  # (batch, C, H, W)
+                reconstructed_frames.append(reconstructed_frame)
+            else:
+                # Fallback: return zero loss if decode not available
+                return torch.tensor(0.0, device=latents.device)
         
-        # Simplified: MSE loss on latents (ensures they maintain structure)
-        # In a full implementation, we'd decode latents -> patches -> frames
-        recon_loss = torch.tensor(0.0, device=latents.device)
+        reconstructed_frames = torch.stack(reconstructed_frames, dim=1)  # (batch, time, C, H, W)
         
-        # Note: Full reconstruction requires implementing decoder path
-        # For now, we return a minimal loss to indicate the structure is in place
+        # Ensure target_frames are in correct format
+        if target_frames.dim() == 5 and target_frames.shape[1] == 3:
+            # (B, C, T, H, W) -> (B, T, C, H, W)
+            target_frames = target_frames.permute(0, 2, 1, 3, 4)
+        elif target_frames.dim() == 4:
+            # (B, C, H, W) -> (B, 1, C, H, W)
+            target_frames = target_frames.unsqueeze(1)
+        
+        # Normalize target frames to [0, 1] if needed
+        if target_frames.max() > 1.0:
+            target_frames = target_frames.float() / 255.0
+        
+        # Compute MSE loss between reconstructed and target frames
+        recon_loss = F.mse_loss(reconstructed_frames, target_frames)
+        
         return recon_loss
     
     def _forward_mtp(

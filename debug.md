@@ -176,4 +176,45 @@ Critical Issues (Now Fixed ✓)
   │ value_loss.py    │ Support for target_head parameter                 │
   ├──────────────────┼───────────────────────────────────────────────────┤
   │ agent_loss.py    │ Auxiliary reconstruction loss structure           │
-  └──────────────────┴───────────────────────────────────────────────────┘                                                    
+  └──────────────────┴───────────────────────────────────────────────────┘                                                  
+
+## MineRL Dataset Statistics (Your Downloaded Dataset)
+
+Total Episodes: 759 episodes across 4 environments:
+MineRLNavigate-v0
+MineRLObtainDiamond-v0
+MineRLObtainIronPickaxe-v0
+MineRLTreechop-v0
+Frame Data (Video/Training Data)
+Total frames: 4,310,077 frames
+Total hours: 59.86 hours (at 20 FPS)
+Average episode length: 5,678.6 frames (~283.9 seconds or ~4.7 minutes)
+Episode length range: 21.6 seconds to 121.3 minutes
+Action Data
+Total action timesteps: 4,139,887 timesteps
+Total hours: 57.50 hours (at 20 FPS)
+Difference: 170,190 fewer action timesteps than frames (~2.36 hours less)
+Notes
+Frame/action mismatch: All 759 episodes have fewer action timesteps than frames. This can happen if:
+Actions are missing at episode boundaries
+Some frames don't have corresponding actions
+Extraction differences between frames and actions
+Frame rate: The dataset uses 20 FPS (from extract_minerl_frames.py), which matches the MineRL standard.
+Official dataset: According to the Zenodo record, the full MineRL 2019 dataset includes:
+MineRLNavigate-v0: 629.9 MB
+MineRLObtainDiamond-v0: 3.6 GB
+MineRLObtainIronPickaxe-v0: 2.8 GB
+MineRLTreechop-v0: 1.5 GB
+Your extracted dataset has approximately 60 hours of video data and 57.5 hours of action data for Phase 1 training.
+
+
+
+
+## Key Differences
+
+Metric	MineRL 2019	VPT Dataset	Ratio
+Episodes	759	26,322	34.7× more
+Video Hours	59.86 hours	~2,541 hours	42.5× more
+Storage Size	~8.6 GB	5.2 TB	~618× larger
+Image Resolution	64×64	360×640	Higher resolution
+Average Episode Length	~4.7 minutes	~5.8 minutes	Similar

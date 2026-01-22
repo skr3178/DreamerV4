@@ -375,6 +375,8 @@ def create_dataloader(
         **kwargs,
     )
     
+    # Disable persistent_workers to avoid hanging issues
+    # Can re-enable if data loading is stable
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -382,4 +384,7 @@ def create_dataloader(
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
+        prefetch_factor=1 if num_workers > 0 else None,  # Reduced from 2 to 1 for faster first batch
+        persistent_workers=False,  # Disabled to avoid hanging
+        timeout=30,  # Add timeout to prevent hanging
     )

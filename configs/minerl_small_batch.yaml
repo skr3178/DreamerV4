@@ -16,20 +16,22 @@ data:
   image_height: 64
   image_width: 64
   in_channels: 3
-  batch_size: 4  # Small batch for testing
-  num_workers: 2  # Reduced workers for small batch
+  batch_size: 16  # Increased for better GPU utilization (model is 2x, so can use larger batch)
+  # With 2x model (22M params), batch_size=16 should fit comfortably in 12GB GPU
+  num_workers: 8  # Increase for faster data loading (you have 32 cores, can use 8-16)
   frame_skip: 1
   resize_to: null
-  max_episodes: 50  # Limit to 50 episodes for quick testing
+  max_episodes: 200  # Increased for larger batch size (more data needed)
 
 # Tokenizer settings (shared transformer architecture)
+# Scaled to 2x parameters: embed_dim=320, depth=8, heads=10 (~22.13M params)
 tokenizer:
   patch_size: 8
-  embed_dim: 256
+  embed_dim: 320  # Increased from 256 (1.25x)
   latent_dim: 32
   num_latent_tokens: 16
-  depth: 6
-  num_heads: 8
+  depth: 8  # Increased from 6 (1.33x)
+  num_heads: 10  # Increased from 8 (should be embed_dim/32)
   dropout: 0.0
   num_registers: 4
   mask_ratio: 0.75
@@ -55,9 +57,10 @@ training:
     epochs: 5  # Fewer epochs for quick test
     learning_rate: 3.0e-4
     weight_decay: 0.01
-    warmup_steps: 100  # Reduced for small test
+    warmup_steps: 1000  # Increased for larger batch size
     max_grad_norm: 1.0
     lpips_weight: 0.2
+    use_lpips: false  # Set to false for faster training (LPIPS is slow)
     save_every: 2  # Save more frequently for testing
 
   # Phase 2: Agent Finetuning

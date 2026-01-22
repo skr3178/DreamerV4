@@ -43,32 +43,38 @@ def load_config(config_path: str) -> Dict:
 
 def create_models(config: Dict, device: torch.device):
     """Create all model components."""
-    
+
     # Tokenizer (frozen)
     tokenizer = CausalTokenizer(
-        image_height=config["tokenizer"]["image_height"],
-        image_width=config["tokenizer"]["image_width"],
-        in_channels=config["tokenizer"]["in_channels"],
+        image_height=config["data"]["image_height"],
+        image_width=config["data"]["image_width"],
+        in_channels=config["data"]["in_channels"],
         patch_size=config["tokenizer"]["patch_size"],
-        embed_dim=config["model"]["embed_dim"],
-        latent_dim=config["model"]["latent_dim"],
+        embed_dim=config["tokenizer"]["embed_dim"],
+        latent_dim=config["tokenizer"]["latent_dim"],
         num_latent_tokens=config["tokenizer"]["num_latent_tokens"],
-        depth=config["model"]["depth"],
-        num_heads=config["model"]["num_heads"],
+        depth=config["tokenizer"]["depth"],
+        num_heads=config["tokenizer"]["num_heads"],
+        dropout=config["tokenizer"].get("dropout", 0.0),
+        num_registers=config["tokenizer"].get("num_registers", 4),
+        mask_ratio=config["tokenizer"].get("mask_ratio", 0.75),
     ).to(device)
     
     # Dynamics (frozen)
     dynamics = DynamicsModel(
-        latent_dim=config["model"]["latent_dim"],
+        latent_dim=config["tokenizer"]["latent_dim"],
         num_latent_tokens=config["tokenizer"]["num_latent_tokens"],
-        embed_dim=config["model"]["embed_dim"],
-        depth=config["model"]["depth"],
-        num_heads=config["model"]["num_heads"],
+        embed_dim=config["tokenizer"]["embed_dim"],
+        depth=config["tokenizer"]["depth"],
+        num_heads=config["tokenizer"]["num_heads"],
+        dropout=config["tokenizer"].get("dropout", 0.0),
         num_discrete_actions=config["dynamics"]["num_discrete_actions"],
+        num_registers=config["dynamics"].get("num_registers", 4),
+        max_shortcut_steps=config["dynamics"].get("max_shortcut_steps", 6),
     ).to(device)
     
     # Calculate input dimension for heads
-    input_dim = config["tokenizer"]["num_latent_tokens"] * config["model"]["latent_dim"]
+    input_dim = config["tokenizer"]["num_latent_tokens"] * config["tokenizer"]["latent_dim"]
     
     # Policy head (trainable)
     policy_head = PolicyHead(
@@ -95,6 +101,17 @@ def create_models(config: Dict, device: torch.device):
     return tokenizer, dynamics, policy_head, value_head, reward_head
 
 
+def strip_compiled_prefix(state_dict: Dict) -> Dict:
+    """Strip '_orig_mod.' prefix from keys if checkpoint was saved with torch.compile()."""
+    new_state_dict = {}
+    for key, value in state_dict.items():
+        if key.startswith("_orig_mod."):
+            new_state_dict[key[len("_orig_mod."):]] = value
+        else:
+            new_state_dict[key] = value
+    return new_state_dict
+
+
 def load_phase2_checkpoint(
     tokenizer: nn.Module,
     dynamics: nn.Module,
@@ -105,28 +122,42 @@ def load_phase2_checkpoint(
     device: torch.device,
 ):
     """Load Phase 2 checkpoint."""
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    
-    tokenizer.load_state_dict(checkpoint["tokenizer"])
-    dynamics.load_state_dict(checkpoint["dynamics"])
-    policy_head.load_state_dict(checkpoint["policy_head"])
-    value_head.load_state_dict(checkpoint["value_head"])
-    reward_head.load_state_dict(checkpoint["reward_head"])
-    
-    print(f"Loaded Phase 2 checkpoint from {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+    # Strip _orig_mod. prefix if checkpoint was saved with torch.compile()
+    tokenizer.load_state_dict(strip_compiled_prefix(checkpoint["tokenizer_state_dict"]))
+    dynamics.load_state_dict(strip_compiled_prefix(checkpoint["dynamics_state_dict"]))
+    policy_head.load_state_dict(strip_compiled_prefix(checkpoint["policy_state_dict"]))
+    value_head.load_state_dict(strip_compiled_prefix(checkpoint["value_state_dict"]))
+    reward_head.load_state_dict(strip_compiled_prefix(checkpoint["reward_state_dict"]))
+
+    epoch = checkpoint.get("epoch", "unknown")
+    step = checkpoint.get("global_step", "unknown")
+    print(f"Loaded Phase 2 checkpoint from {checkpoint_path} (epoch {epoch}, step {step})")
 
 
-def freeze_world_model(tokenizer: nn.Module, dynamics: nn.Module):
-    """Freeze world model components."""
+def freeze_world_model(tokenizer: nn.Module, dynamics: nn.Module, reward_head: nn.Module):
+    """Freeze world model components and reward head.
+
+    In Phase 3, we freeze:
+    - Tokenizer: encodes observations to latent space
+    - Dynamics: predicts next latent states
+    - Reward head: trained in Phase 2, used for reward prediction in imagination
+
+    Only policy and value heads are trained with PMPO and TD(λ).
+    """
     for param in tokenizer.parameters():
         param.requires_grad = False
     for param in dynamics.parameters():
         param.requires_grad = False
-    
+    for param in reward_head.parameters():
+        param.requires_grad = False
+
     tokenizer.eval()
     dynamics.eval()
-    
-    print("Frozen world model (tokenizer + dynamics)")
+    reward_head.eval()
+
+    print("Frozen world model (tokenizer + dynamics) and reward head")
 
 
 def train_phase3(
@@ -158,7 +189,7 @@ def train_phase3(
         dataset,
         batch_size=config["phase3"]["batch_size"],
         shuffle=True,
-        num_workers=config["training"]["num_workers"],
+        num_workers=config["phase3"].get("num_workers", config["data"].get("num_workers", 4)),
         pin_memory=True,
     )
     
@@ -192,12 +223,15 @@ def train_phase3(
         use_distributional=True,
     ).to(device)
     
+    # Calculate input dimension for heads (same as in create_models)
+    input_dim = config["tokenizer"]["num_latent_tokens"] * config["tokenizer"]["latent_dim"]
+
     # EMA target network for value learning (Section 4.4)
     value_target_head = ValueHead(
         input_dim=input_dim,
         hidden_dim=config["heads"]["hidden_dim"],
         num_layers=config["heads"]["num_layers"],
-        num_bins=config["heads"]["num_bins"],
+        num_bins=config["heads"].get("num_bins", 255),
     ).to(device)
     
     # Initialize target network with main network weights
@@ -207,25 +241,23 @@ def train_phase3(
     # EMA decay rate (default 0.999 per common practice, configurable)
     value_ema_decay = config["phase3"].get("value_ema_decay", 0.999)
     
-    # Optimizers (only for trainable heads)
+    # Optimizers (only for trainable heads - policy and value)
+    weight_decay = config["phase3"].get("weight_decay", 0.01)
+
     policy_optimizer = optim.AdamW(
         policy_head.parameters(),
         lr=config["phase3"]["policy_lr"],
-        weight_decay=config["training"]["weight_decay"],
+        weight_decay=weight_decay,
     )
-    
+
     value_optimizer = optim.AdamW(
         value_head.parameters(),
         lr=config["phase3"]["value_lr"],
-        weight_decay=config["training"]["weight_decay"],
+        weight_decay=weight_decay,
     )
-    
-    reward_optimizer = optim.AdamW(
-        reward_head.parameters(),
-        lr=config["phase3"]["value_lr"],
-        weight_decay=config["training"]["weight_decay"],
-    )
-    
+
+    # Note: reward_head is frozen (trained in Phase 2), no optimizer needed
+
     # Training state
     global_step = 0
     best_mean_return = float("-inf")
@@ -250,14 +282,14 @@ def train_phase3(
         
         for batch_idx, batch in enumerate(pbar):
             # Get initial frames from real data
-            frames = batch["frames"].to(device)  # (B, C, T, H, W)
-            
+            frames = batch["frames"].to(device)  # (B, T, C, H, W)
+
             # Encode first frame to get initial latent state
             with torch.no_grad():
                 # Use first frame as starting point
-                first_frame = frames[:, :, 0]  # (B, C, H, W)
+                first_frame = frames[:, 0]  # (B, C, H, W) - first timestep
                 first_frame = first_frame.unsqueeze(2)  # (B, C, 1, H, W)
-                
+
                 # Encode to latent
                 tokenizer_out = tokenizer(first_frame, mask_ratio=0.0)
                 initial_latents = tokenizer_out["latents"][:, 0]  # (B, num_latent, latent_dim)
@@ -441,7 +473,15 @@ def main():
     
     # Load config
     config = load_config(args.config)
-    
+
+    # Map training.phase3 to phase3 for backward compatibility
+    if "training" in config and "phase3" in config["training"]:
+        config["phase3"] = config["training"]["phase3"]
+
+    # Map epochs to num_epochs if present
+    if "phase3" in config and "epochs" in config["phase3"] and "num_epochs" not in config["phase3"]:
+        config["phase3"]["num_epochs"] = config["phase3"]["epochs"]
+
     # Add Phase 3 defaults if not in config
     if "phase3" not in config:
         config["phase3"] = {
@@ -475,14 +515,14 @@ def main():
         args.phase2_checkpoint, device,
     )
     
-    # Freeze world model
-    freeze_world_model(tokenizer, dynamics)
+    # Freeze world model and reward head
+    freeze_world_model(tokenizer, dynamics, reward_head)
     
     # Create dataset
     dataset = MineRLDataset(
-        data_dir=config["dataset"]["data_dir"],
-        sequence_length=config["dataset"]["sequence_length"],
-        image_size=(config["tokenizer"]["image_height"], config["tokenizer"]["image_width"]),
+        data_path=config["data"]["path"],
+        sequence_length=config["data"]["sequence_length"],
+        image_size=(config["data"]["image_height"], config["data"]["image_width"]),
     )
     
     # Run training

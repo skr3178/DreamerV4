@@ -124,24 +124,30 @@ class PMPOLoss(nn.Module):
     ) -> torch.Tensor:
         """
         Compute policy entropy for exploration bonus.
-        
+
         Args:
             policy_output: Policy head output dict
-        
+
         Returns:
             Mean entropy
         """
         if self.discrete_actions:
             logits = policy_output["logits"]
+            # Handle MTP-mode: take first prediction
+            if logits.dim() == 3:
+                logits = logits[:, 0]
             probs = F.softmax(logits, dim=-1)
             log_probs = F.log_softmax(logits, dim=-1)
             entropy = -(probs * log_probs).sum(dim=-1)
         else:
             std = policy_output["std"]
+            # Handle MTP-mode: take first prediction
+            if std.dim() == 3:
+                std = std[:, 0]
             # Entropy of Gaussian: 0.5 * log(2πe * σ²)
             entropy = 0.5 + 0.5 * torch.log(2 * torch.pi * std ** 2)
             entropy = entropy.sum(dim=-1)
-        
+
         return entropy.mean()
     
     def forward(
@@ -177,16 +183,26 @@ class PMPOLoss(nn.Module):
         flat_latents = latents.reshape(-1, latents.shape[-1])  # (B*H, latent_dim)
         flat_actions = actions.reshape(-1) if self.discrete_actions else actions.reshape(-1, actions.shape[-1])
         flat_advantages = advantages.reshape(-1)  # (B*H,)
-        
+
         # Get current policy distribution
         policy_output = policy_head(flat_latents)
-        
-        # Compute log probabilities of taken actions
+
+        # Handle MTP-mode policy heads: take only the first prediction (n=0)
         if self.discrete_actions:
-            dist = Categorical(logits=policy_output["logits"])
+            logits = policy_output["logits"]
+            if logits.dim() == 3:
+                # MTP mode: (B*H, mtp_length+1, num_actions) -> (B*H, num_actions)
+                logits = logits[:, 0]
+            dist = Categorical(logits=logits)
             log_probs = dist.log_prob(flat_actions)
         else:
-            dist = Normal(policy_output["mean"], policy_output["std"])
+            mean = policy_output["mean"]
+            std = policy_output["std"]
+            if mean.dim() == 3:
+                # MTP mode: take first prediction
+                mean = mean[:, 0]
+                std = std[:, 0]
+            dist = Normal(mean, std)
             log_probs = dist.log_prob(flat_actions).sum(dim=-1)
         
         # Bin advantages into D+ and D- (Equation 11)
@@ -220,15 +236,30 @@ class PMPOLoss(nn.Module):
         if prior_head is not None and self.beta_kl > 0:
             with torch.no_grad():
                 prior_output = prior_head(flat_latents)
-            
+
             # Create distributions for KL computation
+            # Handle MTP-mode: take first prediction for both policy and prior
             if self.discrete_actions:
-                policy_dist = Categorical(logits=policy_output["logits"])
-                prior_dist = Categorical(logits=prior_output["logits"])
+                policy_logits = policy_output["logits"]
+                prior_logits = prior_output["logits"]
+                if policy_logits.dim() == 3:
+                    policy_logits = policy_logits[:, 0]
+                if prior_logits.dim() == 3:
+                    prior_logits = prior_logits[:, 0]
+                policy_dist = Categorical(logits=policy_logits)
+                prior_dist = Categorical(logits=prior_logits)
             else:
-                policy_dist = Normal(policy_output["mean"], policy_output["std"])
-                prior_dist = Normal(prior_output["mean"], prior_output["std"])
-            
+                policy_mean, policy_std = policy_output["mean"], policy_output["std"]
+                prior_mean, prior_std = prior_output["mean"], prior_output["std"]
+                if policy_mean.dim() == 3:
+                    policy_mean = policy_mean[:, 0]
+                    policy_std = policy_std[:, 0]
+                if prior_mean.dim() == 3:
+                    prior_mean = prior_mean[:, 0]
+                    prior_std = prior_std[:, 0]
+                policy_dist = Normal(policy_mean, policy_std)
+                prior_dist = Normal(prior_mean, prior_std)
+
             # Compute KL divergence per sample, then apply formula: β/N * Σ KL
             kl_per_sample = self.compute_kl_divergence(policy_dist, prior_dist)  # [B*H]
             kl_sum = kl_per_sample.sum()  # Σ KL

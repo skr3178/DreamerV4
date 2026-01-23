@@ -129,17 +129,21 @@ class TokenizerLoss(nn.Module):
         mask: Optional[torch.Tensor] = None,
         predicted_images: Optional[torch.Tensor] = None,
         target_images: Optional[torch.Tensor] = None,
+        decoder_images: Optional[torch.Tensor] = None,
+        decoder_weight: float = 0.1,
     ) -> Dict[str, torch.Tensor]:
         """
         Compute total tokenizer loss.
-        
+
         Args:
             predicted_patches: Predicted patches (batch, time, num_patches, patch_dim)
             target_patches: Target patches (batch, time, num_patches, patch_dim)
             mask: Optional mask (batch, time, num_patches)
-            predicted_images: Optional reconstructed images for LPIPS
+            predicted_images: Optional reconstructed images for LPIPS (from patches)
             target_images: Optional target images for LPIPS
-        
+            decoder_images: Optional images from dedicated latent decoder (for auxiliary loss)
+            decoder_weight: Weight for decoder auxiliary loss
+
         Returns:
             Dictionary with loss components
         """
@@ -150,38 +154,64 @@ class TokenizerLoss(nn.Module):
             target_patches = target_patches.reshape(batch_size * time_steps, -1, target_patches.shape[-1])
             if mask is not None:
                 mask = mask.reshape(batch_size * time_steps, -1)
-        
-        # Compute MSE loss
+
+        # Compute MSE loss on patches
         mse_loss = self.compute_mse_loss(predicted_patches, target_patches, mask)
-        
+
         # Compute LPIPS loss if images provided
         if self.use_lpips and predicted_images is not None and target_images is not None:
             # Flatten time dimension for images
             if predicted_images.dim() == 5:
                 b, t = predicted_images.shape[:2]
                 predicted_images = predicted_images.reshape(b * t, *predicted_images.shape[2:])
-                target_images = target_images.reshape(b * t, *target_images.shape[2:])
-            
+                target_images_flat = target_images.reshape(b * t, *target_images.shape[2:])
+            else:
+                target_images_flat = target_images
+
             # Normalize images to [-1, 1] if in [0, 1]
+            pred_imgs_norm = predicted_images
+            tgt_imgs_norm = target_images_flat
             if predicted_images.min() >= 0:
-                predicted_images = predicted_images * 2 - 1
-                target_images = target_images * 2 - 1
-            
-            lpips_loss = self.compute_lpips_loss(predicted_images, target_images)
+                pred_imgs_norm = predicted_images * 2 - 1
+                tgt_imgs_norm = target_images_flat * 2 - 1
+
+            lpips_loss = self.compute_lpips_loss(pred_imgs_norm, tgt_imgs_norm)
         else:
             lpips_loss = torch.tensor(0.0, device=predicted_patches.device)
-        
+
+        # Compute auxiliary decoder loss (MSE on images from dedicated latent decoder)
+        decoder_loss = torch.tensor(0.0, device=predicted_patches.device)
+        if decoder_images is not None and target_images is not None:
+            # Flatten time dimension
+            if decoder_images.dim() == 5:
+                b, t = decoder_images.shape[:2]
+                decoder_images_flat = decoder_images.reshape(b * t, *decoder_images.shape[2:])
+                target_images_flat = target_images.reshape(b * t, *target_images.shape[2:])
+            else:
+                decoder_images_flat = decoder_images
+                target_images_flat = target_images
+
+            # MSE loss between decoder output and target images
+            decoder_loss = F.mse_loss(decoder_images_flat, target_images_flat)
+
         # Normalize losses via RMS
         mse_loss_normalized = self.rms_normalize(mse_loss)
         lpips_loss_normalized = self.rms_normalize(lpips_loss) if lpips_loss.item() > 0 else lpips_loss
-        
+        decoder_loss_normalized = self.rms_normalize(decoder_loss) if decoder_loss.item() > 0 else decoder_loss
+
         # Total loss
-        total_loss = mse_loss_normalized + self.lpips_weight * lpips_loss_normalized
-        
+        total_loss = (
+            mse_loss_normalized
+            + self.lpips_weight * lpips_loss_normalized
+            + decoder_weight * decoder_loss_normalized
+        )
+
         return {
             "loss": total_loss,
             "mse_loss": mse_loss,
             "lpips_loss": lpips_loss,
+            "decoder_loss": decoder_loss,
             "mse_loss_normalized": mse_loss_normalized,
             "lpips_loss_normalized": lpips_loss_normalized,
+            "decoder_loss_normalized": decoder_loss_normalized,
         }

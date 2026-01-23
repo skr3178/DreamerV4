@@ -145,7 +145,8 @@ class ShortcutForcingLoss(nn.Module):
         # Compute weighted MSE loss
         # For d_min: weight = 1 (no ramp, no tau scaling)
         # For others (bootstrap): weight = (1-τ)² · w(τ) per Equation 7
-        # The (1-τ)² factor converts x-space loss to v-space loss scale
+        # The (1-τ)² factor balances gradients: x-prediction for stability, but
+        # v-prediction-style loss scaling for balanced training across noise levels
         tau_squared_factor = (1 - signal_level) ** 2
         effective_weights = d_min_mask * 1.0 + d_other_mask * weights * tau_squared_factor
         

@@ -19,7 +19,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
-from .transformer import BlockCausalTransformer, RMSNorm, create_block_causal_mask
+from .transformer import (
+    BlockCausalTransformer,
+    RMSNorm,
+    create_block_causal_mask,
+    create_tokenizer_encoder_mask,
+    create_tokenizer_decoder_mask,
+)
 from .embeddings import PatchEmbedding, LatentTokenEmbedding, RegisterTokens
 
 
@@ -55,8 +61,8 @@ class CausalTokenizer(nn.Module):
         dropout: float = 0.0,
         # Register tokens
         num_registers: int = 4,
-        # Training
-        mask_ratio: float = 0.75,
+        # Training - mask_ratio=None enables per-image random sampling from U(0, 0.9)
+        mask_ratio: Optional[float] = None,
     ):
         """
         Args:
@@ -72,7 +78,10 @@ class CausalTokenizer(nn.Module):
             ffn_dim: FFN hidden dimension
             dropout: Dropout probability
             num_registers: Number of register tokens
-            mask_ratio: Ratio of patches to mask during training
+            mask_ratio: Ratio of patches to mask during training.
+                        None = per-image random from U(0, 0.9) as per paper
+                        0.0 = no masking (inference)
+                        float = fixed ratio for all images
         """
         super().__init__()
         
@@ -179,35 +188,57 @@ class CausalTokenizer(nn.Module):
     def random_masking(
         self,
         patches: torch.Tensor,
-        mask_ratio: float,
+        mask_ratio: Optional[float] = None,
+        random_per_image: bool = True,
+        max_mask_ratio: float = 0.9,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Randomly mask patches for MAE training.
-        
+
+        Per the paper: "The dropout probability is randomized across images as
+        p ~ U(0, 0.9). Patches of each image are replaced with a learned embedding
+        with this probability, so that the tokenizer is sometimes trained on the
+        p=0 case used during inference."
+
         Args:
             patches: (batch, num_patches, embed_dim)
-            mask_ratio: Fraction of patches to mask
-        
+            mask_ratio: If provided, use fixed ratio. If None, sample from U(0, max_mask_ratio)
+            random_per_image: If True, sample different ratio per image (paper method)
+            max_mask_ratio: Maximum mask ratio for uniform sampling (default 0.9)
+
         Returns:
             masked_patches: Patches with some replaced by mask token
             mask: Boolean mask (True = masked)
             ids_restore: Indices to restore original order
         """
         batch_size, num_patches, dim = patches.shape
-        num_mask = int(num_patches * mask_ratio)
-        
+        device = patches.device
+
+        # Sample mask ratio per image from U(0, max_mask_ratio) if not provided
+        if mask_ratio is None and random_per_image:
+            # Per-image random mask ratios as per paper: p ~ U(0, 0.9)
+            mask_ratios = torch.rand(batch_size, device=device) * max_mask_ratio
+        elif mask_ratio is not None:
+            mask_ratios = torch.full((batch_size,), mask_ratio, device=device)
+        else:
+            mask_ratios = torch.rand(batch_size, device=device) * max_mask_ratio
+
         # Random permutation for each batch element
-        noise = torch.rand(batch_size, num_patches, device=patches.device)
+        noise = torch.rand(batch_size, num_patches, device=device)
         ids_shuffle = torch.argsort(noise, dim=1)
         ids_restore = torch.argsort(ids_shuffle, dim=1)
-        
-        # Create mask: True = keep, False = mask
-        mask = torch.ones(batch_size, num_patches, dtype=torch.bool, device=patches.device)
-        mask[:, :num_mask] = False
-        
+
+        # Create mask with per-image ratios
+        # mask[i, j] = True means KEEP, False means MASK
+        mask = torch.ones(batch_size, num_patches, dtype=torch.bool, device=device)
+
+        for i in range(batch_size):
+            num_mask = int(num_patches * mask_ratios[i].item())
+            mask[i, :num_mask] = False
+
         # Unshuffle mask to original positions
         mask = torch.gather(mask, dim=1, index=ids_restore)
-        
+
         # Apply mask token to masked positions
         masked_patches = patches.clone()
         mask_tokens = self.mask_token.expand(batch_size, num_patches, -1)
@@ -216,7 +247,7 @@ class CausalTokenizer(nn.Module):
             patches,
             mask_tokens,
         )
-        
+
         return masked_patches, ~mask, ids_restore  # Return ~mask so True = masked
     
     def encode_frame(
@@ -239,14 +270,23 @@ class CausalTokenizer(nn.Module):
                 - reconstructed: Reconstructed patches
         """
         batch_size = images.shape[0]
-        
+
+        # mask_ratio=None -> per-image random sampling from U(0, 0.9) as per paper
+        # mask_ratio=0.0 -> no masking (inference mode)
+        use_random_masking = mask_ratio is None or mask_ratio > 0
+
         # 1. Patchify and embed
         patch_embeds = self.patch_embed(images)  # (batch, num_patches, embed_dim)
-        
+
         # 2. Apply random masking if training
+        # Per paper: p ~ U(0, 0.9) randomized across images
         mask = None
-        if mask_ratio is not None and mask_ratio > 0:
-            patch_embeds, mask, _ = self.random_masking(patch_embeds, mask_ratio)
+        if use_random_masking:
+            patch_embeds, mask, _ = self.random_masking(
+                patch_embeds,
+                mask_ratio=mask_ratio,  # None for random, or fixed value
+                random_per_image=True,
+            )
         
         # 3. Get latent tokens and register tokens
         latent_tokens = self.latent_tokens(batch_size)  # (batch, num_latent, embed_dim)
@@ -254,10 +294,18 @@ class CausalTokenizer(nn.Module):
         
         # 4. Concatenate: [patches, latent_tokens, registers]
         tokens = torch.cat([patch_embeds, latent_tokens, register_tokens], dim=1)
-        
-        # 5. Process through transformer
-        # For single frame, we don't need block-causal masking
-        tokens = self.transformer(tokens)
+
+        # 5. Process through transformer with asymmetric attention
+        # Even for single frame, we need asymmetric attention:
+        # patches attend only to patches, latents attend to all
+        attention_mask = create_tokenizer_encoder_mask(
+            seq_len=tokens.shape[1],
+            num_patches=self.num_patches,
+            num_latents=self.num_latent_tokens,
+            num_registers=self.register_tokens.num_registers,
+            device=tokens.device,
+        )
+        tokens = self.transformer(tokens, attention_mask=attention_mask)
         
         # 6. Extract latent tokens and apply bottleneck
         latent_start = self.num_patches
@@ -293,39 +341,47 @@ class CausalTokenizer(nn.Module):
         Returns:
             Dictionary with latents and reconstruction info
         """
-        if mask_ratio is None:
-            mask_ratio = self.mask_ratio
-        
+        # mask_ratio=None -> per-image random sampling from U(0, 0.9) as per paper
+        # mask_ratio=0.0 -> no masking (inference mode)
+        # mask_ratio=0.75 -> fixed 75% masking (legacy behavior)
+        use_random_masking = mask_ratio is None or mask_ratio > 0
+
         # Handle different input formats
         if video.dim() == 5:
             if video.shape[1] == self.in_channels:
                 # (batch, channels, time, height, width) -> (batch, time, channels, height, width)
                 video = video.permute(0, 2, 1, 3, 4)
-        
-        batch_size, time_steps, channels, height, width = video.shape
+
+        batch_size, time_steps, _, _, _ = video.shape
         device = video.device
-        
+
         # Build full sequence with block-causal structure
         # Sequence per timestep: [patches, latent_tokens, register_tokens]
         all_tokens = []
         all_original_patches = []
         all_masks = []
-        
+
         for t in range(time_steps):
             frame = video[:, t]  # (batch, channels, height, width)
-            
+
             # 1. Patchify and embed
             patch_embeds = self.patch_embed(frame)  # (batch, num_patches, embed_dim)
-            
+
             # Store original patches for loss computation
             original_patches = self.patch_embed.patchify(frame)  # (batch, num_patches, patch_dim)
             all_original_patches.append(original_patches)
-            
+
             # 2. Apply random masking if training
+            # Per paper: p ~ U(0, 0.9) randomized across images
             mask = None
-            if mask_ratio is not None and mask_ratio > 0:
-                patch_embeds, mask, _ = self.random_masking(patch_embeds, mask_ratio)
-            
+            if use_random_masking:
+                # mask_ratio=None triggers per-image random sampling
+                patch_embeds, mask, _ = self.random_masking(
+                    patch_embeds,
+                    mask_ratio=mask_ratio,  # None for random, or fixed value
+                    random_per_image=True,
+                )
+
             if mask is not None:
                 all_masks.append(mask)
             
@@ -341,12 +397,14 @@ class CausalTokenizer(nn.Module):
         # Shape: (batch, time_steps * tokens_per_frame, embed_dim)
         full_sequence = torch.cat(all_tokens, dim=1)
         
-        # Create block-causal attention mask
-        # Each block corresponds to one timestep's tokens
-        block_size = self.tokens_per_frame
-        attention_mask = create_block_causal_mask(
+        # Create asymmetric attention mask for tokenizer encoder
+        # Per paper: latents attend to all, patches attend only to patches
+        # This forces information to flow through the bottleneck
+        attention_mask = create_tokenizer_encoder_mask(
             seq_len=full_sequence.shape[1],
-            block_size=block_size,
+            num_patches=self.num_patches,
+            num_latents=self.num_latent_tokens,
+            num_registers=self.register_tokens.num_registers,
             device=device,
         )
         
@@ -447,10 +505,10 @@ class CausalTokenizer(nn.Module):
 
     def decode_transformer(self, latents: torch.Tensor) -> torch.Tensor:
         """
-        Original transformer-based decode (for reference/comparison).
+        Transformer-based decode with proper asymmetric attention.
 
-        WARNING: This method uses mask tokens for all patches and may not
-        produce good reconstructions without visible patch context.
+        Per paper: "each decoder modality attends within itself and to the
+        latents, while the latents only attend within themselves."
 
         Args:
             latents: (batch, num_latent_tokens, latent_dim)
@@ -463,20 +521,32 @@ class CausalTokenizer(nn.Module):
         # Project latents back to embed_dim
         latent_embeds = self.latent_tokens.from_bottleneck(latents)
 
-        # Use mask tokens for patches (we don't have patch info in decode-only)
-        patch_embeds = self.mask_token.expand(batch_size, self.num_patches, -1)
-        patch_embeds = patch_embeds + self.patch_embed.pos_embed
+        # Learned decoder tokens for reading out patches (use mask token + position)
+        decoder_tokens = self.mask_token.expand(batch_size, self.num_patches, -1)
+        decoder_tokens = decoder_tokens + self.patch_embed.pos_embed
 
         # Get register tokens
         register_tokens = self.register_tokens(batch_size)
 
-        # Concatenate and process
-        tokens = torch.cat([patch_embeds, latent_embeds, register_tokens], dim=1)
-        tokens = self.transformer(tokens)
+        # Concatenate: [latents, decoder_tokens, registers]
+        # Order matters for the asymmetric attention mask
+        tokens = torch.cat([latent_embeds, decoder_tokens, register_tokens], dim=1)
 
-        # Extract and decode patches
-        patch_output = tokens[:, :self.num_patches]
-        reconstructed = self.decoder_proj(self.decoder_norm(patch_output))
+        # Create asymmetric decoder attention mask
+        # Latents attend only to latents, decoder tokens attend to all
+        attention_mask = create_tokenizer_decoder_mask(
+            seq_len=tokens.shape[1],
+            num_latents=self.num_latent_tokens,
+            num_decoder_tokens=self.num_patches,
+            num_registers=self.register_tokens.num_registers,
+            device=tokens.device,
+        )
+
+        tokens = self.transformer(tokens, attention_mask=attention_mask)
+
+        # Extract decoder token outputs (they come after latents)
+        decoder_output = tokens[:, self.num_latent_tokens:self.num_latent_tokens + self.num_patches]
+        reconstructed = self.decoder_proj(self.decoder_norm(decoder_output))
 
         return self.decode_patches(reconstructed)
     

@@ -1,0 +1,330 @@
+================================================================================
+                    DREAMERV4 PHASE 1 TRAINING ARCHITECTURE
+================================================================================
+
+INPUT DATA
+----------
+Video Frames: (B, T, C, H, W)
+  - B: batch size
+  - T: sequence length (typically 16)
+  - C: channels (3 for RGB)
+  - H, W: height, width (typically 64x64)
+  - Values: [0, 1] normalized from uint8 [0-255]
+
+Example: (8, 16, 3, 64, 64) = 8 batches, 16 timesteps, 3 channels, 64x64 images
+
+
+================================================================================
+                        TOKENIZER TRAINING FLOW
+================================================================================
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│ STEP 1: PATCHIFICATION                                                  │
+└─────────────────────────────────────────────────────────────────────────┘
+
+Input: (B, T, C, H, W) → Reshape to (B, C, T, H, W) if needed
+
+For each timestep t:
+  Frame: (B, C, H, W) = (B, 3, 64, 64)
+    ↓
+  PatchEmbedding.patchify()
+    ↓
+  Patches: (B, num_patches, patch_dim)
+    - num_patches = (H/patch_size) × (W/patch_size) = (64/8) × (64/8) = 64
+    - patch_dim = C × patch_size × patch_size = 3 × 8 × 8 = 192
+    - Example: (B, 64, 192)
+
+  PatchEmbedding.forward() adds:
+    - Linear projection: patches → (B, 64, embed_dim)
+    - Position embeddings: learned spatial positions
+    ↓
+  Patch Embeddings: (B, num_patches, embed_dim) = (B, 64, 256)
+
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│ STEP 2: RANDOM MASKING (MAE - Masked Autoencoding)                      │
+└─────────────────────────────────────────────────────────────────────────┘
+
+Input: Patch Embeddings (B, num_patches, embed_dim)
+
+Process:
+  1. Random permutation for each batch element
+  2. Mask 75% of patches (mask_ratio = 0.75)
+     - 48 patches masked (replaced with mask_token)
+     - 16 patches kept (visible)
+  3. Store mask: (B, num_patches) boolean tensor (True = masked)
+
+Output:
+  - Masked Patches: (B, num_patches, embed_dim)
+    * Visible patches: original embeddings
+    * Masked patches: mask_token embeddings
+  - Mask: (B, num_patches) - indicates which patches were masked
+
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│ STEP 3: TOKEN ASSEMBLY                                                  │
+└─────────────────────────────────────────────────────────────────────────┘
+
+For each timestep t, assemble tokens:
+
+  [Patches, Latent Tokens, Register Tokens]
+
+Components:
+  - Patches: (B, 64, embed_dim) - masked patch embeddings
+  - Latent Tokens: (B, num_latent_tokens, embed_dim) - learned tokens (e.g., 16)
+  - Register Tokens: (B, num_registers, embed_dim) - learned registers (e.g., 4)
+
+Concatenated: (B, tokens_per_frame, embed_dim)
+  - tokens_per_frame = 64 + 16 + 4 = 84
+
+For full sequence (T timesteps):
+  Full Sequence: (B, T × tokens_per_frame, embed_dim)
+    = (B, 16 × 84, 256) = (B, 1344, 256)
+
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│ STEP 4: BLOCK-CAUSAL TRANSFORMER                                        │
+└─────────────────────────────────────────────────────────────────────────┘
+
+Architecture: BlockCausalTransformer
+  - depth: number of transformer layers (e.g., 6)
+  - num_heads: attention heads (e.g., 8)
+  - embed_dim: embedding dimension (e.g., 256)
+
+Input: Full Sequence (B, T × tokens_per_frame, embed_dim)
+
+Block-Causal Attention Mask:
+  - Each block = one timestep's tokens (84 tokens)
+  - Tokens at time t can attend to:
+    * All tokens within timestep t (spatial attention)
+    * All tokens at timesteps <= t (temporal causality)
+  - Tokens at time t CANNOT attend to future timesteps > t
+
+Processing:
+  For each transformer layer:
+    1. Multi-head self-attention (with block-causal mask)
+    2. Feed-forward network
+    3. Residual connections + layer norm
+
+Output: (B, T × tokens_per_frame, embed_dim)
+
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│ STEP 5: LATENT EXTRACTION (Bottleneck)                                  │
+└─────────────────────────────────────────────────────────────────────────┘
+
+For each timestep t:
+  Extract latent tokens from transformer output:
+    - Indices: [num_patches : num_patches + num_latent_tokens]
+    - Latent Output: (B, num_latent_tokens, embed_dim) = (B, 16, 256)
+      ↓
+    LatentTokenEmbedding.to_bottleneck()
+      - Linear projection: embed_dim → latent_dim
+      - Tanh activation: ensures bounded values
+      ↓
+    Latents: (B, num_latent_tokens, latent_dim) = (B, 16, 32)
+
+Stack across time:
+  Final Latents: (B, T, num_latent_tokens, latent_dim) = (B, 16, 16, 32)
+
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│ STEP 6: PATCH RECONSTRUCTION (Decoder)                                  │
+└─────────────────────────────────────────────────────────────────────────┘
+
+For each timestep t:
+  Extract patch tokens from transformer output:
+    - Indices: [0 : num_patches]
+    - Patch Output: (B, num_patches, embed_dim) = (B, 64, 256)
+      ↓
+    Decoder:
+      1. RMSNorm(patch_output)
+      2. Linear projection: embed_dim → patch_dim
+         decoder_proj: (256) → (192)
+      ↓
+    Reconstructed Patches: (B, num_patches, patch_dim) = (B, 64, 192)
+
+Stack across time:
+  Reconstructed: (B, T, num_patches, patch_dim) = (B, 16, 64, 192)
+
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│ STEP 7: UNPATCHIFY TO IMAGES                                            │
+└─────────────────────────────────────────────────────────────────────────┘
+
+For each timestep t:
+  Reconstructed Patches: (B, num_patches, patch_dim)
+    ↓
+  PatchEmbedding.unpatchify()
+    - Reshape: (B, 64, 192) → (B, 3, 64, 64)
+    ↓
+  Reconstructed Frame: (B, C, H, W)
+
+Stack across time:
+  Reconstructed Video: (B, T, C, H, W) = (B, 16, 3, 64, 64)
+
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│ STEP 8: LOSS COMPUTATION                                                │
+└─────────────────────────────────────────────────────────────────────────┘
+
+TokenizerLoss:
+  Inputs:
+    - predicted_patches: (B, T, num_patches, patch_dim) - reconstructed
+    - target_patches: (B, T, num_patches, patch_dim) - original (from patchify)
+    - mask: (B, T, num_patches) - indicates masked patches
+
+  Loss Components:
+    1. MSE Loss:
+       - Compute MSE between predicted and target patches
+       - Optionally only on masked patches (if mask provided)
+       - mse_loss = mean((predicted - target)²)
+
+    2. LPIPS Loss (Perceptual):
+       - Convert patches to images (unpatchify)
+       - Compute LPIPS perceptual distance
+       - lpips_loss = LPIPS(predicted_images, target_images)
+       - Weight: 0.2 × lpips_loss
+
+  Total Loss:
+    loss = mse_loss + 0.2 × lpips_loss
+
+  Backward pass updates tokenizer parameters
+
+
+================================================================================
+                        COMPLETE DATA FLOW SUMMARY
+================================================================================
+
+Input Video
+  (B, T, C, H, W)
+    ↓
+[PATCHIFICATION]
+  (B, T, num_patches, patch_dim)
+    ↓
+[EMBEDDING + POSITION]
+  (B, T, num_patches, embed_dim)
+    ↓
+[RANDOM MASKING - 75% masked]
+  Masked Patches: (B, T, num_patches, embed_dim)
+  Mask: (B, T, num_patches)
+    ↓
+[TOKEN ASSEMBLY]
+  [Patches | Latents | Registers]
+  (B, T, tokens_per_frame, embed_dim)
+    ↓
+[BLOCK-CAUSAL TRANSFORMER]
+  - Processes full sequence with temporal causality
+  (B, T × tokens_per_frame, embed_dim)
+    ↓
+    ├─→ [LATENT EXTRACTION]
+    │     Bottleneck: tanh(Linear(embed_dim → latent_dim))
+    │     (B, T, num_latent, latent_dim) ← OUTPUT: Compressed Latents
+    │
+    └─→ [PATCH DECODER]
+          Decoder: Linear(embed_dim → patch_dim)
+          (B, T, num_patches, patch_dim)
+            ↓
+          [UNPATCHIFY]
+          (B, T, C, H, W) ← OUTPUT: Reconstructed Video
+            ↓
+          [LOSS: MSE + 0.2 × LPIPS]
+            ↓
+          Backward Pass → Update Tokenizer
+
+
+================================================================================
+                        KEY ARCHITECTURAL FEATURES
+================================================================================
+
+1. BLOCK-CAUSAL ATTENTION
+   - Ensures temporal causality: tokens at time t can only see past/present
+   - Allows spatial attention within each timestep
+   - Critical for video generation consistency
+
+2. MASKED AUTOENCODING (MAE)
+   - 75% of patches randomly masked during training
+   - Forces model to learn robust representations
+   - Enables reconstruction from partial information
+
+3. BOTTLENECK WITH TANH
+   - Latents compressed to low dimension (e.g., 32)
+   - Tanh activation bounds values to [-1, 1]
+   - Creates compact representation for dynamics model
+
+4. DUAL OUTPUT
+   - Latents: compressed representation for dynamics model
+   - Reconstructed patches: for training tokenizer via reconstruction loss
+
+5. UNIFIED ARCHITECTURE
+   - Same transformer architecture used for tokenizer and dynamics
+   - Shared block-causal attention mechanism
+   - Consistent token geometry across components
+
+
+================================================================================
+                        TENSOR SHAPES AT EACH STAGE
+================================================================================
+
+Stage                          Shape
+────────────────────────────────────────────────────────────────────────────
+Input Video                    (B, T, C, H, W)           e.g., (8, 16, 3, 64, 64)
+Patches (per frame)            (B, num_patches, patch_dim) e.g., (8, 64, 192)
+Patch Embeddings               (B, num_patches, embed_dim) e.g., (8, 64, 256)
+Masked Patches                 (B, num_patches, embed_dim) e.g., (8, 64, 256)
+Tokens per Frame               (B, tokens_per_frame, embed_dim) e.g., (8, 84, 256)
+Full Sequence                  (B, T×tokens_per_frame, embed_dim) e.g., (8, 1344, 256)
+Transformer Output             (B, T×tokens_per_frame, embed_dim) e.g., (8, 1344, 256)
+Latents (per frame)            (B, num_latent, latent_dim) e.g., (8, 16, 32)
+Latents (full sequence)        (B, T, num_latent, latent_dim) e.g., (8, 16, 16, 32)
+Reconstructed Patches          (B, T, num_patches, patch_dim) e.g., (8, 16, 64, 192)
+Reconstructed Video            (B, T, C, H, W)           e.g., (8, 16, 3, 64, 64)
+
+
+================================================================================
+                        CONFIGURATION PARAMETERS
+================================================================================
+
+Typical Configuration (from configs/minerl.yaml):
+  - image_height: 64
+  - image_width: 64
+  - in_channels: 3
+  - patch_size: 8
+  - embed_dim: 256
+  - latent_dim: 32
+  - num_latent_tokens: 16
+  - num_registers: 4
+  - depth: 6 (transformer layers)
+  - num_heads: 8
+  - mask_ratio: 0.75 (75% masking)
+  - sequence_length: 16 (timesteps)
+
+Calculated Values:
+  - num_patches = (64/8) × (64/8) = 64
+  - patch_dim = 3 × 8 × 8 = 192
+  - tokens_per_frame = 64 + 16 + 4 = 84
+  - full_sequence_length = 16 × 84 = 1344 tokens
+
+
+================================================================================
+                        TRAINING LOOP (train_phase1.py)
+================================================================================
+
+For each batch:
+  1. Train Tokenizer:
+     - Forward: frames → tokenizer → latents + reconstructed
+     - Loss: TokenizerLoss(MSE + LPIPS)
+     - Backward: update tokenizer parameters
+     
+  2. Train Dynamics (separate step):
+     - Encode frames to latents (tokenizer frozen)
+     - Forward: latents + actions → dynamics → predicted latents
+     - Loss: ShortcutForcingLoss
+     - Backward: update dynamics parameters
+
+Both models trained alternately on same batches.
+
+
+================================================================================
+                        END OF PHASE 1 TRAINING MAP
+================================================================================

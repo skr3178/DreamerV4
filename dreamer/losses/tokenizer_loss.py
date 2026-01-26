@@ -62,11 +62,14 @@ class TokenizerLoss(nn.Module):
     def rms_normalize(self, loss: torch.Tensor) -> torch.Tensor:
         """
         Normalize loss by RMS (Root Mean Square).
-        
+
         This helps balance losses of different scales.
+        The RMS is detached to preserve gradient flow through the loss.
         """
         rms = torch.sqrt(torch.mean(loss ** 2) + 1e-8)
-        return loss / rms
+        # Detach RMS to preserve gradients - we want to scale the loss
+        # but not backprop through the normalization factor
+        return loss / rms.detach()
     
     def compute_mse_loss(
         self,

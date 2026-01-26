@@ -17,7 +17,7 @@ data:
   image_height: 64
   image_width: 64
   in_channels: 3
-  batch_size: 16  # Reduced for Phase 1 (trains both tokenizer + dynamics, needs more memory)
+  batch_size: 4  # Reduced for Phase 1 (trains both tokenizer + dynamics, needs more memory)
   num_workers: 4  # Workers for data loading
   frame_skip: 1
   resize_to: null

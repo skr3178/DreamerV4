@@ -191,6 +191,144 @@ def create_block_causal_mask(
     return mask
 
 
+def create_tokenizer_encoder_mask(
+    seq_len: int,
+    num_patches: int,
+    num_latents: int,
+    num_registers: int,
+    device: torch.device = None,
+) -> torch.Tensor:
+    """
+    Create asymmetric attention mask for the tokenizer encoder.
+
+    Per the paper: "the encoder allows the latent tokens to attend to all
+    modalities, while each modality only attends within itself."
+
+    Within each timestep block:
+    - Patches attend ONLY to patches (forces info through bottleneck)
+    - Latents attend to patches + latents + registers
+    - Registers attend to patches + latents + registers
+
+    Across timesteps: block-causal (can attend to all past timesteps)
+
+    Args:
+        seq_len: Total sequence length
+        num_patches: Number of patch tokens per timestep
+        num_latents: Number of latent tokens per timestep
+        num_registers: Number of register tokens per timestep
+        device: Device to create mask on
+
+    Returns:
+        Attention mask of shape (seq_len, seq_len)
+        True = attend, False = mask out
+    """
+    block_size = num_patches + num_latents + num_registers
+    num_blocks = (seq_len + block_size - 1) // block_size
+
+    mask = torch.zeros(seq_len, seq_len, dtype=torch.bool, device=device)
+
+    for block_idx in range(num_blocks):
+        block_start = block_idx * block_size
+        block_end = min((block_idx + 1) * block_size, seq_len)
+
+        # Token ranges within this block
+        patch_start = block_start
+        patch_end = min(block_start + num_patches, seq_len)
+        latent_start = block_start + num_patches
+        latent_end = min(block_start + num_patches + num_latents, seq_len)
+        register_start = block_start + num_patches + num_latents
+        register_end = block_end
+
+        # === Cross-block attention (block-causal): attend to ALL tokens in past blocks ===
+        if block_idx > 0:
+            past_end = block_start  # End of previous blocks
+            mask[block_start:block_end, :past_end] = True
+
+        # === Within-block attention (asymmetric) ===
+        # Patches attend ONLY to patches in the same block
+        if patch_end > patch_start:
+            mask[patch_start:patch_end, patch_start:patch_end] = True
+
+        # Latents attend to everything in the same block (patches + latents + registers)
+        if latent_end > latent_start:
+            mask[latent_start:latent_end, block_start:block_end] = True
+
+        # Registers attend to everything in the same block (patches + latents + registers)
+        if register_end > register_start:
+            mask[register_start:register_end, block_start:block_end] = True
+
+    return mask
+
+
+def create_tokenizer_decoder_mask(
+    seq_len: int,
+    num_latents: int,
+    num_decoder_tokens: int,
+    num_registers: int = 0,
+    device: torch.device = None,
+) -> torch.Tensor:
+    """
+    Create asymmetric attention mask for the tokenizer decoder.
+
+    Per the paper: "each decoder modality attends within itself and to the
+    latents, while the latents only attend within themselves."
+
+    Within each timestep block:
+    - Latents attend ONLY to latents (no backward info flow from patches)
+    - Decoder tokens (patches) attend to latents + decoder tokens + registers
+    - Registers attend to latents + decoder tokens + registers
+
+    Across timesteps: block-causal (can attend to all past timesteps)
+
+    Args:
+        seq_len: Total sequence length
+        num_latents: Number of latent tokens per timestep
+        num_decoder_tokens: Number of decoder/patch tokens per timestep
+        num_registers: Number of register tokens per timestep
+        device: Device to create mask on
+
+    Returns:
+        Attention mask of shape (seq_len, seq_len)
+        True = attend, False = mask out
+    """
+    block_size = num_latents + num_decoder_tokens + num_registers
+    num_blocks = (seq_len + block_size - 1) // block_size
+
+    mask = torch.zeros(seq_len, seq_len, dtype=torch.bool, device=device)
+
+    for block_idx in range(num_blocks):
+        block_start = block_idx * block_size
+        block_end = min((block_idx + 1) * block_size, seq_len)
+
+        # Token ranges within this block (order: latents, decoder_tokens, registers)
+        latent_start = block_start
+        latent_end = min(block_start + num_latents, seq_len)
+        decoder_start = block_start + num_latents
+        decoder_end = min(block_start + num_latents + num_decoder_tokens, seq_len)
+        register_start = block_start + num_latents + num_decoder_tokens
+        register_end = block_end
+
+        # === Cross-block attention (block-causal): attend to ALL tokens in past blocks ===
+        if block_idx > 0:
+            past_end = block_start
+            mask[block_start:block_end, :past_end] = True
+
+        # === Within-block attention (asymmetric) ===
+        # Latents attend ONLY to latents in the same block (no backward flow)
+        if latent_end > latent_start:
+            mask[latent_start:latent_end, latent_start:latent_end] = True
+
+        # Decoder tokens attend to latents + decoder tokens + registers
+        if decoder_end > decoder_start:
+            mask[decoder_start:decoder_end, block_start:block_end] = True
+
+        # Registers attend to latents + decoder tokens + registers
+        if register_end > register_start:
+            mask[register_start:register_end, block_start:block_end] = True
+
+    return mask
+
+
 def create_spatial_mask(
     seq_len: int,
     block_size: int,
@@ -291,6 +429,7 @@ class BlockCausalAttention(nn.Module):
         use_qk_norm: bool = True,
         use_flash_attention: bool = True,
         allow_flash_only_for_standard_causal: bool = True,
+        attn_logit_soft_cap: Optional[float] = 50.0,
     ):
         super().__init__()
         self.dim = dim
@@ -303,6 +442,8 @@ class BlockCausalAttention(nn.Module):
         self.use_qk_norm = use_qk_norm
         self.use_flash_attention = use_flash_attention
         self.allow_flash_only_for_standard_causal = allow_flash_only_for_standard_causal
+        # Attention logit soft capping (Gemma 2 style) for training stability
+        self.attn_logit_soft_cap = attn_logit_soft_cap
 
         # Validate GQA config
         assert num_heads % self.num_kv_heads == 0, \
@@ -390,7 +531,14 @@ class BlockCausalAttention(nn.Module):
         else:
             # Manual attention — required for block-causal or any custom mask
             attn_weights = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-            
+
+            # Apply attention logit soft capping for training stability
+            # soft_cap * tanh(logits / soft_cap) keeps logits in [-soft_cap, soft_cap]
+            if self.attn_logit_soft_cap is not None:
+                attn_weights = self.attn_logit_soft_cap * torch.tanh(
+                    attn_weights / self.attn_logit_soft_cap
+                )
+
             if attention_mask is not None:
                 # Use provided block-causal (or other custom) mask
                 attn_mask = torch.zeros_like(attn_weights)
@@ -442,6 +590,7 @@ class TransformerBlock(nn.Module):
         ffn_dim: Optional[int] = None,
         dropout: float = 0.0,
         use_qk_norm: bool = True,
+        attn_logit_soft_cap: Optional[float] = 50.0,
     ):
         super().__init__()
 
@@ -456,6 +605,7 @@ class TransformerBlock(nn.Module):
             head_dim=head_dim,
             dropout=dropout,
             use_qk_norm=use_qk_norm,
+            attn_logit_soft_cap=attn_logit_soft_cap,
         )
         
         # Pre-norm for FFN
@@ -529,6 +679,7 @@ class BlockCausalTransformer(nn.Module):
         use_qk_norm: bool = True,
         use_spacetime_factorization: bool = False,
         temporal_layer_interval: int = 4,
+        attn_logit_soft_cap: Optional[float] = 50.0,
     ):
         """
         Args:
@@ -543,6 +694,7 @@ class BlockCausalTransformer(nn.Module):
             use_qk_norm: Whether to use QK normalization
             use_spacetime_factorization: Whether to use space/time factorized attention (Section 3.2)
             temporal_layer_interval: Apply temporal attention every N layers (default: 4)
+            attn_logit_soft_cap: Soft cap for attention logits (default: 50.0, None to disable)
         """
         super().__init__()
 
@@ -570,6 +722,7 @@ class BlockCausalTransformer(nn.Module):
                 ffn_dim=ffn_dim,
                 dropout=dropout,
                 use_qk_norm=use_qk_norm,
+                attn_logit_soft_cap=attn_logit_soft_cap,
             )
             for _ in range(depth)
         ])

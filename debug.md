@@ -218,3 +218,29 @@ Video Hours	59.86 hours	~2,541 hours	42.5× more
 Storage Size	~8.6 GB	5.2 TB	~618× larger
 Image Resolution	64×64	360×640	Higher resolution
 Average Episode Length	~4.7 minutes	~5.8 minutes	Similar
+
+## fixes jan 26:
+
+
+Summary of Changes                                                                                                                                                      
+                                                                                                                                                                          
+  1. Asymmetric Attention Masks (transformer.py)                                                                                                                          
+                                                                                                                                                                          
+  - Added create_tokenizer_encoder_mask(): patches only attend to patches, latents attend to all                                                                          
+  - Added create_tokenizer_decoder_mask(): latents only attend to latents, decoder tokens attend to all                                                                   
+  - Forces information through the bottleneck                                                                                                                             
+                                                                                                                                                                          
+  2. Updated Tokenizer (tokenizer.py)                                                                                                                                     
+                                                                                                                                                                          
+  - encode_frame() and encode() now use asymmetric encoder masks                                                                                                          
+  - decode_transformer() uses asymmetric decoder mask with correct token ordering                                                                                         
+                                                                                                                                                                          
+  3. Per-Image Random Masking (tokenizer.py)                                                                                                                              
+                                                                                                                                                                          
+  - random_masking() now supports mask_ratio=None for per-image sampling from U(0, 0.9)                                                                                   
+  - Matches paper: "The dropout probability is randomized across images as p ~ U(0, 0.9)"                                                                                 
+                                                                                                                                                                          
+  4. Fixed RMS Normalization (tokenizer_loss.py)                                                                                                                          
+                                                                                                                                                                          
+  - Added .detach() to RMS normalization to preserve gradient flow                                                                                                        
+  - Bug: dividing loss by its own magnitude made it constant with zero gradient       

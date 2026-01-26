@@ -94,12 +94,25 @@ def train_tokenizer_step(
     
     # Forward pass
     output = tokenizer(frames, mask_ratio=tokenizer.mask_ratio)
-    
-    # Compute loss
+
+    # Reconstruct images from patches for LPIPS
+    B, T = output["reconstructed"].shape[:2]
+    reconstructed_images = torch.stack([
+        tokenizer.decode_patches(output["reconstructed"][:, t])
+        for t in range(T)
+    ], dim=1)  # (B, T, C, H, W)
+
+    # Target images (permute back to B, T, C, H, W)
+    target_images = frames.permute(0, 2, 1, 3, 4) if frames.shape[1] == tokenizer.in_channels else frames
+
+    # Compute loss with images for LPIPS
     loss_dict = loss_fn(
         predicted_patches=output["reconstructed"],
         target_patches=output["original_patches"],
         mask=output.get("mask"),
+        predicted_images=reconstructed_images,
+        target_images=target_images,
+        decoder_images=output.get("decoder_images"),
     )
     
     loss = loss_dict["loss"]
@@ -176,12 +189,16 @@ def train_dynamics_step(
     return {k: v.item() for k, v in loss_dict.items()}
 
 
-def train_phase1(config: Dict):
+def train_phase1(config: Dict, checkpoint_path: Optional[str] = None):
     """
     Train Phase 1: World Model Pretraining.
     
     1. Train tokenizer with MAE + LPIPS
     2. Train dynamics with shortcut forcing
+    
+    Args:
+        config: Training configuration
+        checkpoint_path: Optional path to checkpoint to resume from
     """
     # Setup
     requested_device = config["experiment"]["device"]
@@ -217,6 +234,23 @@ def train_phase1(config: Dict):
     print_flush("Creating models...")
     tokenizer = create_tokenizer(config).to(device)
     dynamics = create_dynamics_model(config).to(device)
+    
+    # Load checkpoint if provided
+    start_epoch = 0
+    global_step = 0
+    checkpoint = None
+    if checkpoint_path:
+        checkpoint_file = Path(checkpoint_path)
+        if checkpoint_file.exists():
+            print_flush(f"Loading checkpoint from {checkpoint_file}")
+            checkpoint = torch.load(checkpoint_file, map_location=device, weights_only=False)
+            tokenizer.load_state_dict(checkpoint["tokenizer_state_dict"])
+            dynamics.load_state_dict(checkpoint["dynamics_state_dict"])
+            start_epoch = checkpoint.get("epoch", 0)
+            global_step = checkpoint.get("global_step", 0)
+            print_flush(f"Resumed from epoch {start_epoch}, step {global_step}")
+        else:
+            print_flush(f"Warning: Checkpoint not found at {checkpoint_file}, starting from scratch")
     
     # Verify models are on correct device
     tokenizer_device = next(tokenizer.parameters()).device
@@ -284,6 +318,15 @@ def train_phase1(config: Dict):
         eps=config["optimizer"]["eps"],
     )
     
+    # Load optimizer states if resuming
+    if checkpoint is not None:
+        if "tokenizer_optimizer" in checkpoint:
+            tokenizer_optimizer.load_state_dict(checkpoint["tokenizer_optimizer"])
+            print_flush("Loaded tokenizer optimizer state")
+        if "dynamics_optimizer" in checkpoint:
+            dynamics_optimizer.load_state_dict(checkpoint["dynamics_optimizer"])
+            print_flush("Loaded dynamics optimizer state")
+    
     # Create schedulers
     total_steps = len(train_loader) * phase1_config["epochs"]
     tokenizer_scheduler = CosineAnnealingLR(
@@ -297,6 +340,13 @@ def train_phase1(config: Dict):
         eta_min=config["scheduler"]["min_lr"],
     )
     
+    # Fast-forward schedulers if resuming
+    if checkpoint is not None and global_step > 0:
+        for _ in range(global_step):
+            tokenizer_scheduler.step()
+            dynamics_scheduler.step()
+        print_flush(f"Fast-forwarded schedulers to step {global_step}")
+    
     # Tensorboard
     writer = SummaryWriter(log_dir)
     
@@ -306,10 +356,13 @@ def train_phase1(config: Dict):
     max_steps = phase1_config.get("max_steps", None)
     if max_steps:
         print_flush(f"Max steps: {max_steps} (will stop early if reached)")
-    print_flush(f"Logging every {config['logging']['log_every']} steps\n")
-    global_step = 0
+    print_flush(f"Logging every {config['logging']['log_every']} steps")
+    if checkpoint is not None:
+        print_flush(f"Resuming from epoch {start_epoch + 1}/{phase1_config['epochs']}, step {global_step}\n")
+    else:
+        print_flush()
     
-    for epoch in range(phase1_config["epochs"]):
+    for epoch in range(start_epoch, phase1_config["epochs"]):
         tokenizer.train()
         dynamics.train()
         
@@ -332,6 +385,23 @@ def train_phase1(config: Dict):
             }
         }
         
+        # Calculate starting batch index if resuming mid-epoch
+        start_batch_idx = 0
+        if checkpoint is not None and epoch == start_epoch:
+            # If resuming in the same epoch, calculate which batch to start from
+            # global_step tells us how many batches we've processed
+            batches_per_epoch = len(train_loader)
+            if global_step > 0:
+                # Calculate which batch in this epoch corresponds to global_step
+                # global_step = (epoch * batches_per_epoch) + batch_idx
+                batch_idx_in_epoch = global_step % batches_per_epoch
+                start_batch_idx = batch_idx_in_epoch + 1  # Continue from next batch
+                if start_batch_idx >= batches_per_epoch:
+                    # If we've passed the end of this epoch, move to next epoch
+                    start_batch_idx = 0
+                    continue
+                print_flush(f"Resuming from batch {start_batch_idx} in epoch {epoch+1} (was at step {global_step})")
+        
         # Configure tqdm to flush output immediately
         pbar = tqdm(
             train_loader, 
@@ -340,7 +410,21 @@ def train_phase1(config: Dict):
             mininterval=1.0,  # Update at least every second
         )
         
+        # Set progress bar to correct starting position if resuming
+        # Note: tqdm will auto-increment, so we need to account for that
+        if start_batch_idx > 0:
+            # We'll manually update the display during skip
+            pass
+        
         for batch_idx, batch in enumerate(pbar):
+            # Skip batches if resuming mid-epoch
+            if batch_idx < start_batch_idx:
+                # Update global_step to keep it in sync, but don't train
+                global_step += 1
+                # Manually set progress bar position (tqdm auto-increments, so we correct it)
+                pbar.n = batch_idx + 1
+                pbar.refresh()
+                continue
             # Train tokenizer
             tok_loss = train_tokenizer_step(
                 tokenizer=tokenizer,
@@ -426,7 +510,24 @@ def train_phase1(config: Dict):
                 sys.stderr.flush()
             
             global_step += 1
-            
+
+            # Save mid-epoch checkpoint (at halfway point of each epoch)
+            num_batches = len(train_loader)
+            if batch_idx == num_batches // 2:
+                mid_checkpoint = {
+                    "epoch": epoch,
+                    "batch_idx": batch_idx,
+                    "global_step": global_step,
+                    "tokenizer_state_dict": tokenizer.state_dict(),
+                    "dynamics_state_dict": dynamics.state_dict(),
+                    "tokenizer_optimizer": tokenizer_optimizer.state_dict(),
+                    "dynamics_optimizer": dynamics_optimizer.state_dict(),
+                    "config": config,
+                }
+                mid_path = ckpt_dir / f"phase1_epoch{epoch+1}_mid.pt"
+                torch.save(mid_checkpoint, mid_path)
+                print_flush(f"\nSaved mid-epoch checkpoint to {mid_path}")
+
             # Save checkpoint periodically during training (for max_steps scenarios)
             save_every_steps = phase1_config.get("save_every_steps", None)
             if save_every_steps and global_step % save_every_steps == 0:
@@ -518,18 +619,19 @@ def train_phase1(config: Dict):
         writer.add_scalar("epoch/lr/tokenizer", tok_lr, epoch)
         writer.add_scalar("epoch/lr/dynamics", dyn_lr, epoch)
         
-        # Save checkpoint
-        if (epoch + 1) % phase1_config["save_every"] == 0:
-            checkpoint = {
-                "epoch": epoch,
-                "tokenizer_state_dict": tokenizer.state_dict(),
-                "dynamics_state_dict": dynamics.state_dict(),
-                "tokenizer_optimizer": tokenizer_optimizer.state_dict(),
-                "dynamics_optimizer": dynamics_optimizer.state_dict(),
-                "config": config,
-            }
-            torch.save(checkpoint, ckpt_dir / f"phase1_epoch_{epoch+1}.pt")
-            print_flush(f"Saved checkpoint to {ckpt_dir / f'phase1_epoch_{epoch+1}.pt'}")
+        # Save checkpoint at end of every epoch
+        checkpoint = {
+            "epoch": epoch,
+            "global_step": global_step,
+            "tokenizer_state_dict": tokenizer.state_dict(),
+            "dynamics_state_dict": dynamics.state_dict(),
+            "tokenizer_optimizer": tokenizer_optimizer.state_dict(),
+            "dynamics_optimizer": dynamics_optimizer.state_dict(),
+            "config": config,
+        }
+        epoch_checkpoint_path = ckpt_dir / f"phase1_epoch_{epoch+1}.pt"
+        torch.save(checkpoint, epoch_checkpoint_path)
+        print_flush(f"Saved end-of-epoch checkpoint to {epoch_checkpoint_path}")
     
     # Save final checkpoint
     final_checkpoint = {
@@ -562,6 +664,12 @@ def main():
         default=None,
         help="Device to use (overrides config)",
     )
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Path to checkpoint to resume from",
+    )
     args = parser.parse_args()
     
     # Load config
@@ -572,7 +680,7 @@ def main():
         config["experiment"]["device"] = args.device
     
     # Run training
-    train_phase1(config)
+    train_phase1(config, checkpoint_path=args.checkpoint)
 
 
 if __name__ == "__main__":

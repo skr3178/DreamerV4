@@ -1,0 +1,241 @@
+================================================================================
+              DREAMERV4 PHASE 1: TOKENIZER TRAINING FLOW
+================================================================================
+
+                    ┌─────────────────────────┐
+                    │  INPUT VIDEO FRAMES     │
+                    │  (B, T, C, H, W)        │
+                    │ e.g., (8, 16, 3, 64, 64)│
+                    └───────────┬─────────────┘
+                                │
+                                ▼
+                    ┌─────────────────────────┐
+                    │   PATCHIFICATION        │
+                    │   For each frame:       │
+                    │   64×64 → 8×8 patches   │
+                    │   = 64 patches/frame    │
+                    └───────────┬─────────────┘
+                                │
+                                ▼
+                    ┌─────────────────────────┐
+                    │   PATCH EMBEDDING       │
+                    │  patches → embed_dim    │
+                    │  + position embeddings  │
+                    │   (B, 64, 256)          │
+                    └───────────┬─────────────┘
+                                │
+                                ▼
+                    ┌─────────────────────────┐
+                    │   RANDOM MASKING        │
+                    │   Mask 75% of patches   │
+                    │   Replace with          │
+                    │   mask_token            │
+                    │   ┌─────┐               │
+                    │   │███  │ 75% masked    │
+                    │   │  ███│               │
+                    │   └─────┘               │
+                    └───────────┬─────────────┘
+                                │
+                                ▼
+                    ┌─────────────────────────┐
+                    │   TOKEN ASSEMBLY        │
+                    │   [Patches | Latents |  │
+                    │    Registers]           │
+                    │   (B, 84, 256)          │
+                    │   per frame             │
+                    └───────────┬─────────────┘
+                                │
+                                ▼
+        ┌───────────────────────────────────────────────────────┐
+        │                                                       │
+        │         BLOCK-CAUSAL TRANSFORMER                      │
+        │         (6 layers, 8 heads)                           │
+        │                                                       │
+        │    ┌─────────────────────────────────────┐            │
+        │    │  Full Sequence: (B, 1344, 256)      │            │
+        │    │  (16 timesteps × 84 tokens)         │            │
+        │    └─────────────────────────────────────┘            │
+        │                    │                                  │
+        │    Block-Causal Mask:                                 │
+        │    Time t can attend to times ≤ t                    │
+        │    ┌─────┬─────┬─────┬─────┐                         │
+        │    │  t0 │  t1 │  t2 │ ... │                         │
+        │    ├─────┼─────┼─────┼─────┤                         │
+        │ t0 │  ✓  │  ✗  │  ✗  │  ✗  │                         │
+        │ t1 │  ✓  │  ✓  │  ✗  │  ✗  │                         │
+        │ t2 │  ✓  │  ✓  │  ✓  │  ✗  │                         │
+        │ ...│  ✓  │  ✓  │  ✓  │  ✓  │                         │
+        │                    │                                  │
+        └────────────────────┼──────────────────────────────────┘
+                             │
+                             │
+        ┌─────────────────────┴─────────────────────┐
+        │                                           │
+        ▼                                           ▼
+┌───────────────────────┐              ┌───────────────────────┐
+│  LATENT EXTRACTION    │              │  PATCH DECODER        │
+│                       │              │                       │
+│  Extract latent       │              │  Extract patch        │
+│  tokens from output   │              │  tokens from output   │
+│                       │              │                       │
+│  (B, 16, 256)         │              │  (B, 64, 256)         │
+│       ↓               │              │       ↓               │
+│  Bottleneck:          │              │  Decoder:             │
+│  Linear(256→32)       │              │  Linear(256→192)      │
+│       ↓               │              │       ↓               │
+│  Tanh activation      │              │  (B, 64, 192)         │
+│       ↓               │              │       ↓               │
+│  LATENTS              │              │  UNPATCHIFY           │
+│  (B, T, 16, 32)       │              │       ↓               │
+│                       │              │  RECONSTRUCTED        │
+│  [Compressed          │              │  VIDEO                │
+│   Representation]     │              │  (B, T, 3, 64, 64)    │
+└───────────────────────┘              └───────────────────────┘
+        │                                           │
+        │                                           │
+        └───────────────────┬─────────────────────┘
+                            │
+                            ▼
+                ┌─────────────────────────┐
+                │   LOSS COMPUTATION       │
+                │                         │
+                │   MSE Loss:              │
+                │   Compare reconstructed │
+                │   patches to original   │
+                │                         │
+                │   LPIPS Loss:            │
+                │   Perceptual distance   │
+                │   (weight: 0.2)          │
+                │                         │
+                │   Total = MSE + 0.2×LPIPS│
+                └─────────────────────────┘
+                            │
+                            ▼
+                ┌─────────────────────────┐
+                │   BACKWARD PASS         │
+                │   Update tokenizer      │
+                │   parameters            │
+                └─────────────────────────┘
+
+
+================================================================================
+                        DETAILED COMPONENT BREAKDOWN
+================================================================================
+
+1. PATCHIFICATION
+   ────────────────────────────────────────────────────────────────────────
+   Input:  (B, C, H, W) = (B, 3, 64, 64)
+   
+   Process:
+     - Divide image into 8×8 patches
+     - Each patch: 8×8×3 = 192 dimensions
+     - Total patches: (64/8) × (64/8) = 64 patches
+   
+   Output: (B, 64, 192) - flattened patches
+
+
+2. EMBEDDING
+   ────────────────────────────────────────────────────────────────────────
+   Input:  (B, 64, 192) - patches
+   
+   Process:
+     - Linear projection: 192 → 256 (embed_dim)
+     - Add learned position embeddings
+   
+   Output: (B, 64, 256) - patch embeddings
+
+
+3. MASKING
+   ────────────────────────────────────────────────────────────────────────
+   Input:  (B, 64, 256) - patch embeddings
+   
+   Process:
+     - Random permutation for each batch
+     - Mask 75% (48 patches) → replace with mask_token
+     - Keep 25% (16 patches) → original embeddings
+   
+   Output:
+     - Masked patches: (B, 64, 256)
+     - Mask: (B, 64) boolean (True = masked)
+
+
+4. TOKEN ASSEMBLY
+   ────────────────────────────────────────────────────────────────────────
+   Components per frame:
+     - Patches:        (B, 64, 256)
+     - Latent Tokens:  (B, 16, 256) - learned
+     - Register Tokens: (B, 4, 256) - learned
+   
+   Concatenated: (B, 84, 256) per frame
+   
+   Full sequence: (B, 16×84, 256) = (B, 1344, 256)
+
+
+5. TRANSFORMER
+   ────────────────────────────────────────────────────────────────────────
+   Architecture:
+     - Depth: 6 layers
+     - Heads: 8 attention heads
+     - Embed dim: 256
+   
+   Attention:
+     - Block-causal mask
+     - Each block = one timestep (84 tokens)
+     - Temporal causality enforced
+   
+   Output: (B, 1344, 256)
+
+
+6. LATENT EXTRACTION
+   ────────────────────────────────────────────────────────────────────────
+   For each timestep:
+     - Extract tokens [64:80] (latent tokens)
+     - Project: 256 → 32 (latent_dim)
+     - Apply tanh activation
+   
+   Output: (B, T, 16, 32) - compressed latents
+
+
+7. PATCH DECODER
+   ────────────────────────────────────────────────────────────────────────
+   For each timestep:
+     - Extract tokens [0:64] (patch tokens)
+     - Apply RMSNorm
+     - Project: 256 → 192 (patch_dim)
+   
+   Output: (B, T, 64, 192) - reconstructed patches
+
+
+8. UNPATCHIFY
+   ────────────────────────────────────────────────────────────────────────
+   Input:  (B, 64, 192) - patches per frame
+   
+   Process:
+     - Reshape: 64 patches → 8×8 grid
+     - Each patch: 192 → 8×8×3
+   
+   Output: (B, 3, 64, 64) - reconstructed frame
+
+
+9. LOSS
+   ────────────────────────────────────────────────────────────────────────
+   Components:
+     - MSE: Mean squared error on patches
+     - LPIPS: Perceptual loss on images (weight: 0.2)
+   
+   Loss = MSE(predicted_patches, target_patches) 
+        + 0.2 × LPIPS(predicted_images, target_images)
+
+
+================================================================================
+                        KEY INSIGHTS
+================================================================================
+
+✓ Block-causal attention ensures temporal consistency
+✓ Masked autoencoding (75%) forces robust representation learning
+✓ Dual output: latents for dynamics + reconstruction for training
+✓ Tanh bottleneck creates bounded, compact latents
+✓ Unified architecture with tokenizer and dynamics sharing transformer design
+
+
+================================================================================

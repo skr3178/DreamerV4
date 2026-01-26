@@ -206,6 +206,7 @@ PMPO/
 flow/
 Block_cascading/
 shortcut_models/
+reference/
 
 # Generated videos directory
 videos/

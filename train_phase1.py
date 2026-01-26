@@ -385,22 +385,27 @@ def train_phase1(config: Dict, checkpoint_path: Optional[str] = None):
             }
         }
         
-        # Calculate starting batch index if resuming mid-epoch
-        start_batch_idx = 0
-        if checkpoint is not None and epoch == start_epoch:
-            # If resuming in the same epoch, calculate which batch to start from
-            # global_step tells us how many batches we've processed
+        # Handle mid-epoch resume: skip to next epoch to avoid slow dataloader iteration
+        # Only applies to the exact epoch saved in checkpoint, not subsequent ones
+        if checkpoint is not None and epoch == checkpoint.get("epoch", -1):
             batches_per_epoch = len(train_loader)
-            if global_step > 0:
-                # Calculate which batch in this epoch corresponds to global_step
-                # global_step = (epoch * batches_per_epoch) + batch_idx
-                batch_idx_in_epoch = global_step % batches_per_epoch
-                start_batch_idx = batch_idx_in_epoch + 1  # Continue from next batch
-                if start_batch_idx >= batches_per_epoch:
-                    # If we've passed the end of this epoch, move to next epoch
-                    start_batch_idx = 0
+            saved_step = checkpoint.get("global_step", 0)
+            if saved_step > 0:
+                batch_idx_in_epoch = saved_step % batches_per_epoch
+                if batch_idx_in_epoch > 0:
+                    # Skip to next epoch instead of iterating through batches
+                    # This avoids the slow dataloader iteration overhead
+                    skipped_batches = batches_per_epoch - batch_idx_in_epoch
+                    print_flush(f"Checkpoint was mid-epoch (batch {batch_idx_in_epoch}/{batches_per_epoch})")
+                    print_flush(f"Skipping to epoch {epoch + 2} to avoid slow dataloader iteration")
+                    print_flush(f"(Skipping {skipped_batches} batches, ~{skipped_batches/batches_per_epoch*100:.1f}% of one epoch)")
+                    # Advance schedulers for the skipped batches
+                    for _ in range(skipped_batches):
+                        tokenizer_scheduler.step()
+                        dynamics_scheduler.step()
+                    # Adjust global_step to account for skipped batches
+                    global_step += skipped_batches
                     continue
-                print_flush(f"Resuming from batch {start_batch_idx} in epoch {epoch+1} (was at step {global_step})")
         
         # Configure tqdm to flush output immediately
         pbar = tqdm(
@@ -410,21 +415,7 @@ def train_phase1(config: Dict, checkpoint_path: Optional[str] = None):
             mininterval=1.0,  # Update at least every second
         )
         
-        # Set progress bar to correct starting position if resuming
-        # Note: tqdm will auto-increment, so we need to account for that
-        if start_batch_idx > 0:
-            # We'll manually update the display during skip
-            pass
-        
         for batch_idx, batch in enumerate(pbar):
-            # Skip batches if resuming mid-epoch
-            if batch_idx < start_batch_idx:
-                # Update global_step to keep it in sync, but don't train
-                global_step += 1
-                # Manually set progress bar position (tqdm auto-increments, so we correct it)
-                pbar.n = batch_idx + 1
-                pbar.refresh()
-                continue
             # Train tokenizer
             tok_loss = train_tokenizer_step(
                 tokenizer=tokenizer,

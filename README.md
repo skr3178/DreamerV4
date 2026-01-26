@@ -5,6 +5,8 @@ Reports with 12x more GPU compute show the tokenizer learns granular forms which
 - Reference: https://github.com/HKimiwada/Dreamer4
 - Trained on 8x 16GB V100 GPUs using data from zhwang4ai/OpenAI-Minecraft-Contractor (pixel/frame is not different than current config)
 
+## PROJECT STATUS: ABANDONED FOR NOW
+
 ## Reference Implementations Reviewed
 
 | Implementation | Source | Target Domain | GPU Requirements |

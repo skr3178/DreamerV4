@@ -34,6 +34,14 @@ from dreamer.losses.pmpo_loss import PMPOLoss
 from dreamer.losses.value_loss import TDLambdaLoss
 from dreamer.data.minerl_dataset import MineRLDataset
 
+# Optional Cosmos tokenizer import
+try:
+    from dreamer.models.cosmos_tokenizer_wrapper import create_cosmos_tokenizer
+    _cosmos_available = True
+except ImportError:
+    _cosmos_available = False
+    create_cosmos_tokenizer = None
+
 
 def load_config(config_path: str) -> Dict:
     """Load configuration from YAML file."""
@@ -44,33 +52,50 @@ def load_config(config_path: str) -> Dict:
 def create_models(config: Dict, device: torch.device):
     """Create all model components."""
 
+    cosmos_config = config.get("cosmos_tokenizer", {})
+    use_cosmos = cosmos_config.get("enabled", False)
+
     # Tokenizer (frozen)
-    tokenizer = CausalTokenizer(
-        image_height=config["data"]["image_height"],
-        image_width=config["data"]["image_width"],
-        in_channels=config["data"]["in_channels"],
-        patch_size=config["tokenizer"]["patch_size"],
-        embed_dim=config["tokenizer"]["embed_dim"],
-        latent_dim=config["tokenizer"]["latent_dim"],
-        num_latent_tokens=config["tokenizer"]["num_latent_tokens"],
-        depth=config["tokenizer"]["depth"],
-        num_heads=config["tokenizer"]["num_heads"],
-        dropout=config["tokenizer"].get("dropout", 0.0),
-        num_registers=config["tokenizer"].get("num_registers", 4),
-        mask_ratio=config["tokenizer"].get("mask_ratio", 0.75),
-    ).to(device)
-    
-    # Dynamics (frozen)
+    if use_cosmos:
+        if not _cosmos_available:
+            raise ImportError("Cosmos tokenizer requested but not available.")
+        tokenizer = create_cosmos_tokenizer(
+            checkpoint_path=cosmos_config.get("checkpoint_path", "cosmos_tokenizer/CV8x8x8"),
+            pool_tokens=cosmos_config.get("pool_tokens", 16),
+            input_resolution=cosmos_config.get("input_resolution", 256),
+            device=str(device),
+            dtype=cosmos_config.get("dtype", "bfloat16"),
+        )
+    else:
+        tokenizer = CausalTokenizer(
+            image_height=config["data"]["image_height"],
+            image_width=config["data"]["image_width"],
+            in_channels=config["data"]["in_channels"],
+            patch_size=config["tokenizer"]["patch_size"],
+            embed_dim=config["tokenizer"]["embed_dim"],
+            latent_dim=config["tokenizer"]["latent_dim"],
+            num_latent_tokens=config["tokenizer"]["num_latent_tokens"],
+            depth=config["tokenizer"]["depth"],
+            num_heads=config["tokenizer"]["num_heads"],
+            dropout=config["tokenizer"].get("dropout", 0.0),
+            num_registers=config["tokenizer"].get("num_registers", 4),
+            mask_ratio=config["tokenizer"].get("mask_ratio", 0.75),
+        ).to(device)
+
+    # Dynamics (frozen) - read arch from dynamics config, fall back to tokenizer
+    dynamics_cfg = config.get("dynamics", {})
+    tokenizer_cfg = config.get("tokenizer", {})
+
     dynamics = DynamicsModel(
-        latent_dim=config["tokenizer"]["latent_dim"],
-        num_latent_tokens=config["tokenizer"]["num_latent_tokens"],
-        embed_dim=config["tokenizer"]["embed_dim"],
-        depth=config["tokenizer"]["depth"],
-        num_heads=config["tokenizer"]["num_heads"],
-        dropout=config["tokenizer"].get("dropout", 0.0),
-        num_discrete_actions=config["dynamics"]["num_discrete_actions"],
-        num_registers=config["dynamics"].get("num_registers", 4),
-        max_shortcut_steps=config["dynamics"].get("max_shortcut_steps", 6),
+        latent_dim=tokenizer_cfg["latent_dim"],
+        num_latent_tokens=tokenizer_cfg["num_latent_tokens"],
+        embed_dim=dynamics_cfg.get("embed_dim", tokenizer_cfg.get("embed_dim", 256)),
+        depth=dynamics_cfg.get("num_layers", tokenizer_cfg.get("depth", 6)),
+        num_heads=dynamics_cfg.get("num_heads", tokenizer_cfg.get("num_heads", 8)),
+        dropout=tokenizer_cfg.get("dropout", 0.0),
+        num_discrete_actions=dynamics_cfg["num_discrete_actions"],
+        num_registers=dynamics_cfg.get("num_registers", tokenizer_cfg.get("num_registers", 4)),
+        max_shortcut_steps=dynamics_cfg.get("max_shortcut_steps", 6),
     ).to(device)
     
     # Calculate input dimension for heads
@@ -120,12 +145,15 @@ def load_phase2_checkpoint(
     reward_head: nn.Module,
     checkpoint_path: str,
     device: torch.device,
+    use_cosmos: bool = False,
 ):
     """Load Phase 2 checkpoint."""
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
     # Strip _orig_mod. prefix if checkpoint was saved with torch.compile()
-    tokenizer.load_state_dict(strip_compiled_prefix(checkpoint["tokenizer_state_dict"]))
+    # Skip tokenizer state_dict for Cosmos (pretrained, not in checkpoint)
+    if not use_cosmos and "tokenizer_state_dict" in checkpoint:
+        tokenizer.load_state_dict(strip_compiled_prefix(checkpoint["tokenizer_state_dict"]))
     dynamics.load_state_dict(strip_compiled_prefix(checkpoint["dynamics_state_dict"]))
     policy_head.load_state_dict(strip_compiled_prefix(checkpoint["policy_state_dict"]))
     value_head.load_state_dict(strip_compiled_prefix(checkpoint["value_state_dict"]))
@@ -271,6 +299,14 @@ def train_phase3(
     print(f"  Policy LR: {config['phase3']['policy_lr']}")
     print(f"  Value LR: {config['phase3']['value_lr']}")
     
+    # Check for max_steps limit
+    max_steps = config["phase3"].get("max_steps", None)
+    if max_steps:
+        print(f"  Max steps: {max_steps} (will stop early if reached)")
+    
+    # Initialize avg_return to avoid UnboundLocalError
+    avg_return = 0.0
+    
     for epoch in range(config["phase3"]["num_epochs"]):
         epoch_policy_loss = 0.0
         epoch_value_loss = 0.0
@@ -400,12 +436,40 @@ def train_phase3(
                     if policy_result['n_positive'].item() < 10 and policy_result['n_negative'].item() < 10:
                         print(f"  WARNING: Degenerate advantage distribution - no learning signal!")
                         print(f"    Consider enabling percentile_binning or adding intrinsic rewards")
+            
+            # Check if we've reached max_steps (after processing batch)
+            if max_steps and global_step >= max_steps:
+                print(f"\nReached max_steps ({max_steps}), stopping training early.")
+                # Calculate averages before breaking
+                if num_batches > 0:
+                    avg_policy_loss = epoch_policy_loss / num_batches
+                    avg_value_loss = epoch_value_loss / num_batches
+                    avg_entropy = epoch_entropy / num_batches
+                    avg_return = epoch_mean_return / num_batches
+                else:
+                    avg_policy_loss = 0.0
+                    avg_value_loss = 0.0
+                    avg_entropy = 0.0
+                    avg_return = 0.0
+                # Break from inner loop
+                break
         
-        # Epoch summary
-        avg_policy_loss = epoch_policy_loss / num_batches
-        avg_value_loss = epoch_value_loss / num_batches
-        avg_entropy = epoch_entropy / num_batches
-        avg_return = epoch_mean_return / num_batches
+        # Epoch summary (calculate if we didn't break early)
+        if num_batches > 0:
+            avg_policy_loss = epoch_policy_loss / num_batches
+            avg_value_loss = epoch_value_loss / num_batches
+            avg_entropy = epoch_entropy / num_batches
+            avg_return = epoch_mean_return / num_batches
+        else:
+            # Fallback if no batches processed
+            avg_policy_loss = 0.0
+            avg_value_loss = 0.0
+            avg_entropy = 0.0
+            avg_return = 0.0
+        
+        # Break outer loop if max_steps reached
+        if max_steps and global_step >= max_steps:
+            break
         
         print(f"\nEpoch {epoch + 1} Summary:")
         print(f"  Avg Policy Loss: {avg_policy_loss:.4f}")
@@ -506,13 +570,17 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
+    # Check if using Cosmos tokenizer
+    cosmos_config = config.get("cosmos_tokenizer", {})
+    use_cosmos = cosmos_config.get("enabled", False)
+
     # Create models
     tokenizer, dynamics, policy_head, value_head, reward_head = create_models(config, device)
-    
+
     # Load Phase 2 checkpoint
     load_phase2_checkpoint(
         tokenizer, dynamics, policy_head, value_head, reward_head,
-        args.phase2_checkpoint, device,
+        args.phase2_checkpoint, device, use_cosmos=use_cosmos,
     )
     
     # Freeze world model and reward head

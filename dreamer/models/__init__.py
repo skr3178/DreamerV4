@@ -18,6 +18,15 @@ from .dynamics import DynamicsModel
 from .heads import PolicyHead, ValueHead, RewardHead
 from .embeddings import PatchEmbedding, ActionEmbedding, SignalEmbedding
 
+# Cosmos tokenizer wrapper (optional import)
+try:
+    from .cosmos_tokenizer_wrapper import CosmosTokenizerWrapper, create_cosmos_tokenizer
+    _cosmos_available = True
+except ImportError:
+    _cosmos_available = False
+    CosmosTokenizerWrapper = None
+    create_cosmos_tokenizer = None
+
 __all__ = [
     # Transformer components
     "RMSNorm",
@@ -38,3 +47,7 @@ __all__ = [
     "ActionEmbedding",
     "SignalEmbedding",
 ]
+
+# Add Cosmos exports if available
+if _cosmos_available:
+    __all__.extend(["CosmosTokenizerWrapper", "create_cosmos_tokenizer"])

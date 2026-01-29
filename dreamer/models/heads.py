@@ -15,7 +15,7 @@ from typing import Optional, Tuple, Dict, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import Categorical, Normal
+from torch.distributions import Categorical, Normal, Independent, Bernoulli
 
 
 class PolicyHead(nn.Module):
@@ -218,7 +218,6 @@ class PolicyHead(nn.Module):
         dist_params = self.forward(latents)
         
         if self.use_multi_discrete:
-            from torch.distributions import Independent, Bernoulli, Categorical
             
             keyboard_logits = dist_params["keyboard_logits"]
             camera_logits = dist_params["camera_logits"]
@@ -291,7 +290,6 @@ class PolicyHead(nn.Module):
         dist_params = self.forward(latents)
         
         if self.use_multi_discrete:
-            from torch.distributions import Independent, Bernoulli, Categorical
             
             keyboard_logits = dist_params["keyboard_logits"]
             camera_logits = dist_params["camera_logits"]

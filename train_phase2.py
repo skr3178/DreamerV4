@@ -36,6 +36,14 @@ from dreamer.losses import AgentFinetuningLoss
 from dreamer.data import create_dataloader
 from dreamer.utils import set_seed, count_parameters, freeze_module
 
+# Optional Cosmos tokenizer import
+try:
+    from dreamer.models import CosmosTokenizerWrapper, create_cosmos_tokenizer
+    _cosmos_available = True
+except ImportError:
+    _cosmos_available = False
+    create_cosmos_tokenizer = None
+
 
 def load_config(config_path: str) -> Dict:
     """Load configuration from YAML file."""
@@ -43,8 +51,25 @@ def load_config(config_path: str) -> Dict:
         return yaml.safe_load(f)
 
 
-def create_tokenizer(config: Dict) -> CausalTokenizer:
-    """Create tokenizer model from config."""
+def create_tokenizer(config: Dict, device: str = "cuda"):
+    """Create tokenizer model from config (supports Cosmos or CausalTokenizer)."""
+    cosmos_config = config.get("cosmos_tokenizer", {})
+    use_cosmos = cosmos_config.get("enabled", False)
+
+    if use_cosmos:
+        if not _cosmos_available:
+            raise ImportError(
+                "Cosmos tokenizer requested but not available. "
+                "Make sure Cosmos-Tokenizer is installed."
+            )
+        return create_cosmos_tokenizer(
+            checkpoint_path=cosmos_config.get("checkpoint_path", "cosmos_tokenizer/CV8x8x8"),
+            pool_tokens=cosmos_config.get("pool_tokens", 16),
+            input_resolution=cosmos_config.get("input_resolution", 256),
+            device=device,
+            dtype=cosmos_config.get("dtype", "bfloat16"),
+        )
+
     return CausalTokenizer(
         image_height=config["data"]["image_height"],
         image_width=config["data"]["image_width"],
@@ -62,17 +87,24 @@ def create_tokenizer(config: Dict) -> CausalTokenizer:
 
 
 def create_dynamics_model(config: Dict) -> DynamicsModel:
-    """Create dynamics model from config."""
+    """Create dynamics model from config.
+
+    Reads architecture params from dynamics config first, falling back to
+    tokenizer config for backward compatibility (original config shares arch).
+    """
+    dynamics_config = config.get("dynamics", {})
+    tokenizer_config = config.get("tokenizer", {})
+
     return DynamicsModel(
-        latent_dim=config["tokenizer"]["latent_dim"],
-        num_latent_tokens=config["tokenizer"]["num_latent_tokens"],
-        embed_dim=config["tokenizer"]["embed_dim"],
-        depth=config["tokenizer"]["depth"],
-        num_heads=config["tokenizer"]["num_heads"],
-        dropout=config["tokenizer"]["dropout"],
-        num_discrete_actions=config["dynamics"]["num_discrete_actions"],
-        num_registers=config["dynamics"]["num_registers"],
-        max_shortcut_steps=config["dynamics"]["max_shortcut_steps"],
+        latent_dim=tokenizer_config["latent_dim"],
+        num_latent_tokens=tokenizer_config["num_latent_tokens"],
+        embed_dim=dynamics_config.get("embed_dim", tokenizer_config.get("embed_dim", 256)),
+        depth=dynamics_config.get("num_layers", tokenizer_config.get("depth", 6)),
+        num_heads=dynamics_config.get("num_heads", tokenizer_config.get("num_heads", 8)),
+        dropout=tokenizer_config.get("dropout", 0.0),
+        num_discrete_actions=dynamics_config["num_discrete_actions"],
+        num_registers=dynamics_config.get("num_registers", tokenizer_config.get("num_registers", 4)),
+        max_shortcut_steps=dynamics_config.get("max_shortcut_steps", 6),
     )
 
 
@@ -135,11 +167,19 @@ def train_agent_step(
     
     # Move data to device
     frames = batch["frames"].to(device, non_blocking=True)  # non_blocking for faster transfer
-    actions = batch["actions"].to(device, non_blocking=True)
     rewards = batch["rewards"].to(device, non_blocking=True)
+
+    # Handle actions: tensor for categorical, dict for multi-discrete
+    raw_actions = batch["actions"]
+    if isinstance(raw_actions, dict):
+        actions = {k: v.to(device, non_blocking=True) for k, v in raw_actions.items()}
+    else:
+        actions = raw_actions.to(device, non_blocking=True)
     
-    # Reshape frames for tokenizer
-    if frames.dim() == 5 and frames.shape[2] != tokenizer.in_channels:
+    # Reshape frames for tokenizer: (B, T, C, H, W) -> (B, C, T, H, W)
+    # Cosmos wrapper handles both formats internally, CausalTokenizer needs (B, C, T, H, W)
+    in_channels = getattr(tokenizer, "in_channels", 3)
+    if frames.dim() == 5 and frames.shape[2] != in_channels:
         frames = frames.permute(0, 2, 1, 3, 4)
     
     # Get latents from tokenizer (no gradient - frozen)
@@ -157,8 +197,8 @@ def train_agent_step(
     batch_size, time_steps, num_latent, latent_dim = latents.shape
     latents_flat = latents.reshape(batch_size, time_steps, -1)  # (B, T, num_latent * latent_dim)
 
-    # Handle action format
-    if actions.dim() == 3 and actions.shape[-1] == 1:
+    # Handle action format (skip for multi-discrete dict actions)
+    if not isinstance(actions, dict) and actions.dim() == 3 and actions.shape[-1] == 1:
         actions = actions.squeeze(-1)
 
     # Compute loss (heads forward pass happens inside loss_fn)
@@ -212,17 +252,25 @@ def train_phase2(config: Dict, checkpoint_path: Optional[str] = None):
     log_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     
+    # Check if using Cosmos tokenizer
+    cosmos_config = config.get("cosmos_tokenizer", {})
+    use_cosmos = cosmos_config.get("enabled", False)
+
     # Create models
     print_flush("Creating models...")
-    tokenizer = create_tokenizer(config).to(device)
+    tokenizer = create_tokenizer(config, device=str(device))
+    if not use_cosmos:
+        tokenizer = tokenizer.to(device)
     dynamics = create_dynamics_model(config).to(device)
     heads = {k: v.to(device) for k, v in create_heads(config).items()}
-    
+
     # Load Phase 1 checkpoint BEFORE compiling (compilation changes state_dict keys)
     if checkpoint_path:
         print_flush(f"Loading Phase 1 checkpoint from {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-        tokenizer.load_state_dict(checkpoint["tokenizer_state_dict"])
+        # Skip tokenizer state_dict for Cosmos (pretrained, not in checkpoint)
+        if not use_cosmos and "tokenizer_state_dict" in checkpoint:
+            tokenizer.load_state_dict(checkpoint["tokenizer_state_dict"])
         dynamics.load_state_dict(checkpoint["dynamics_state_dict"])
     else:
         # Try to find latest Phase 1 checkpoint
@@ -230,7 +278,8 @@ def train_phase2(config: Dict, checkpoint_path: Optional[str] = None):
         if phase1_ckpt.exists():
             print_flush(f"Loading Phase 1 checkpoint from {phase1_ckpt}")
             checkpoint = torch.load(phase1_ckpt, map_location=device, weights_only=False)
-            tokenizer.load_state_dict(checkpoint["tokenizer_state_dict"])
+            if not use_cosmos and "tokenizer_state_dict" in checkpoint:
+                tokenizer.load_state_dict(checkpoint["tokenizer_state_dict"])
             dynamics.load_state_dict(checkpoint["dynamics_state_dict"])
         else:
             print_flush("Warning: No Phase 1 checkpoint found, training from scratch")
@@ -370,7 +419,9 @@ def train_phase2(config: Dict, checkpoint_path: Optional[str] = None):
             
             # Log first batch info
             if batch_idx == 1:
-                print_flush(f"✓ First batch received! Shapes: frames={batch['frames'].shape}, actions={batch['actions'].shape}, rewards={batch['rewards'].shape}")
+                actions_info = batch['actions'].shape if hasattr(batch['actions'], 'shape') else f"dict({list(batch['actions'].keys())})"
+                rewards_info = batch['rewards'].shape if hasattr(batch['rewards'], 'shape') else type(batch['rewards']).__name__
+                print_flush(f"✓ First batch received! Shapes: frames={batch['frames'].shape}, actions={actions_info}, rewards={rewards_info}")
                 sys.stdout.flush()
                 sys.stderr.flush()
             

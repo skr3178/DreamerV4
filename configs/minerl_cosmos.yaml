@@ -1,0 +1,166 @@
+# DreamerV4 Configuration with Pretrained Cosmos Tokenizer
+# Uses NVIDIA Cosmos CV8x8x8 instead of training tokenizer from scratch
+# Optimized for RTX 3060 (12GB VRAM)
+
+# Experiment settings
+experiment:
+  name: "dreamerv4_minerl_cosmos"
+  seed: 42
+  device: "cuda"
+  log_dir: "logs"
+  checkpoint_dir: "checkpoints"
+
+# Cosmos Tokenizer Settings
+cosmos_tokenizer:
+  enabled: true
+  checkpoint_path: "cosmos_tokenizer/CV8x8x8"
+  model_variant: "CV8x8x8"
+  dtype: "bfloat16"
+  input_resolution: 256    # Upsample MineRL 64x64 -> 256x256 for Cosmos
+  pool_tokens: 16          # Pool 1024 native tokens -> 16 (critical for 12GB VRAM)
+
+# Data settings
+data:
+  path: "data/mineRL_extracted"
+  sequence_length: 32      # Can use longer sequences since tokenizer is faster
+  image_height: 64
+  image_width: 64
+  in_channels: 3
+  batch_size: 4            # Reduced for memory; use gradient accumulation
+  num_workers: 4
+  frame_skip: 1
+  resize_to: null
+
+# Tokenizer output settings (after Cosmos encoding + pooling)
+# These are used by heads and dynamics model
+tokenizer:
+  # Output dimensions from Cosmos wrapper (after spatial pooling)
+  num_latent_tokens: 16    # After pooling (native would be 1024)
+  latent_dim: 16           # Cosmos latent channel dimension
+  # Flattened: 16 * 16 = 256 (for head input)
+
+  # Legacy fields (only used if cosmos_tokenizer.enabled = false)
+  patch_size: 8
+  embed_dim: 256
+  depth: 6
+  num_heads: 8
+  dropout: 0.0
+  num_registers: 4
+  mask_ratio: 0.75
+
+# Dynamics model settings
+dynamics:
+  # Adjusted for 256-dim latent input (16 tokens * 16 dim)
+  embed_dim: 256           # Internal transformer dimension
+  num_layers: 12           # Reduced from paper's 32 for memory
+  num_heads: 8
+  max_shortcut_steps: 6    # K in paper (2^K = 64 max steps)
+  num_registers: 4
+
+  # MineRL action space (unchanged from original)
+  action_space_type: "multi_discrete"
+  num_discrete_actions: 144
+
+# Agent heads settings
+heads:
+  # IMPORTANT: Input dimension is now 256 (16 tokens * 16 dim)
+  # Previously was 512 (16 tokens * 32 dim) with original tokenizer
+  input_dim: 256           # 16 * 16 = 256
+  hidden_dim: 256
+  num_layers: 2
+  num_bins: 255
+  num_actions: 144
+
+# Training settings
+training:
+  # Phase 1: Dynamics Model Training (tokenizer is frozen Cosmos)
+  phase1:
+    steps: 200000          # Reduced from 500k (stable Cosmos features)
+    learning_rate: 3.0e-4
+    weight_decay: 0.01
+    warmup_steps: 1000
+    max_grad_norm: 1.0
+    save_every: 10000
+
+    # Gradient accumulation for effective batch size
+    gradient_accumulation_steps: 4  # Effective batch = 4 * 4 = 16
+
+    # Mixed precision for memory efficiency
+    precision: "bfloat16"
+
+    # No tokenizer loss - Cosmos is frozen
+    train_tokenizer: false
+
+  # Phase 2: Agent Finetuning (unchanged except for input dims)
+  phase2:
+    epochs: 50
+    learning_rate: 1.0e-4
+    weight_decay: 0.01
+    warmup_steps: 500
+    max_grad_norm: 1.0
+    reward_weight: 1.0
+    freeze_transformer: true
+    save_every: 5
+    use_focal_loss: true
+    focal_gamma: 2.0
+    focal_alpha: 0.25
+
+  # Phase 3: Imagination Training with PMPO (unchanged)
+  phase3:
+    epochs: 100
+    batch_size: 4
+    gradient_accumulation_steps: 4
+
+    imagination_horizon: 15
+    num_denoising_steps: 4
+
+    discount: 0.997
+    lambda: 0.95
+
+    value_ema_decay: 0.999
+
+    pmpo_alpha: 0.5
+    pmpo_beta_kl: 0.3
+    entropy_coef: 0.003
+    advantage_bins: 16
+    use_percentile_binning: true
+    percentile_threshold: 10.0
+
+    policy_lr: 3.0e-5
+    value_lr: 1.0e-4
+
+    value_loss_scale: 0.5
+
+    grad_clip: 1.0
+    save_every: 10
+    num_workers: 4
+
+# Optimizer settings
+optimizer:
+  type: "adamw"
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+# Scheduler settings
+scheduler:
+  type: "cosine"
+  min_lr: 1.0e-6
+
+# Logging settings
+logging:
+  log_every: 100
+  eval_every: 1000
+  use_wandb: false
+  wandb_project: "dreamerv4_cosmos"
+
+# Memory optimization for RTX 3060 (12GB)
+memory:
+  # Expected VRAM usage:
+  # - Cosmos encoder (frozen, bf16): ~2 GB
+  # - Dynamics model (trainable): ~4 GB
+  # - Activations (batch=4, seq=32): ~2 GB
+  # - Optimizer states: ~1 GB
+  # - Total: ~9 GB (leaves headroom)
+
+  gradient_checkpointing: false  # Enable if OOM
+  empty_cache_frequency: 100     # Clear cache every N steps

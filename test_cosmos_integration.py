@@ -3,7 +3,9 @@ Test Cosmos Tokenizer Integration for DreamerV4
 
 Tests:
   Phase A (Smoke tests):
-    1. Wrapper shape test - Load Cosmos encoder, verify output (B, T/8, 16, 16)
+    1. Wrapper shape test - Load Cosmos encoder, verify output (B, T_lat, 16, 16)
+       where T_lat = 1 + ceil((T - 1) / 8) due to CAUSAL compression
+       Example: 32 frames → 5 latent steps (not 4!)
     2. Dynamics compatibility - Verify dynamics accepts 16 tokens x 16 dim
     3. Head compatibility - Verify heads accept 256-dim input
 
@@ -348,6 +350,7 @@ def test_single_training_step(device="cuda", data_path="data/mineRL_subset"):
     print_info(f"GPU memory after encode: {mem_after_encode:.2f} GB")
 
     # Align actions to latent time dimension
+    # CAUSAL: T_lat = 1 + ceil((T - 1) / 8), e.g., 32 frames → 5 latent steps
     T_lat = latents.shape[1]
     if actions.dim() == 3 and actions.shape[-1] == 1:
         actions = actions.squeeze(-1)

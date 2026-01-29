@@ -6,57 +6,90 @@ Plan saved to: ~/.claude/plans/velvet-tinkering-owl.md
 
 ## Process Overview
 
+### Temporal Compression (Causal)
+
+Cosmos CV8x8x8 is a **causal** video tokenizer. The first frame gets its own latent step (no future context), then subsequent frames are grouped by 8:
+
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         PHASE 1: World Model Training                       │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  Video Frames ──► Cosmos Tokenizer (FROZEN) ──► Latents ──► Dynamics Model │
-│  (B,3,32,64,64)   upsample→encode→pool        (B,4,16,16)   (TRAINABLE)    │
-│                                                     │                       │
-│                                                     ▼                       │
-│                                            Shortcut Forcing Loss            │
-│                                            (predict future latents)         │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                      PHASE 2: Agent Finetuning (BC)                         │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  Frames ──► Tokenizer ──► Latents ──► flatten ──► Policy Head (TRAINABLE)  │
-│             (FROZEN)      (B,T,16,16)  (B,T,256)   ├─► predict actions      │
-│                                            │       └─► behavior cloning     │
-│                                            │                                │
-│                                            └──► Reward Head (TRAINABLE)     │
-│                                                  └─► predict rewards        │
-│                                                                             │
-│  Dynamics: FROZEN    Value Head: initialized but not main focus            │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                    PHASE 3: Imagination RL (PMPO)                           │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  Real Frame ──► Tokenizer ──► Initial Latent ──► Imagination Rollout       │
-│                 (FROZEN)                         (using frozen dynamics)    │
-│                                                         │                   │
-│                     ┌───────────────────────────────────┘                   │
-│                     ▼                                                       │
-│              ┌─────────────┐                                                │
-│              │ For H steps │ ◄─────────────────────────────┐                │
-│              └─────────────┘                               │                │
-│                     │                                      │                │
-│     Latent ──► Policy Head ──► Action ──► Dynamics ──► Next Latent         │
-│                (TRAINABLE)              (FROZEN)                            │
-│                     │                                                       │
-│                     └──► Reward Head (FROZEN) ──► Predicted Reward          │
-│                                                                             │
-│     Compute: TD(λ) returns, advantages                                      │
-│     Update:  Policy (PMPO loss), Value Head (TD loss)                       │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
+T_latent = 1 + ceil((T_frames - 1) / 8)
+
+Example: 32 frames → 1 + ceil(31/8) = 1 + 4 = 5 latent steps
+```
+
+This prevents future information leakage — critical for real-time interaction.
+
+---
+
+```
+PHASE 1: World Model Training
+══════════════════════════════════════════════════════════════════════════════
+
+  Video (B,3,32,64,64)
+    │
+    ▼ Upsample (bicubic)
+  (B,3,32,256,256)
+    │
+    ▼ Cosmos Tokenizer (FROZEN)
+  Raw Latents (B,16,5,32,32)          ← C=16, T_lat=5, H/8=32, W/8=32
+    │
+    ▼ Reshape
+  (B,5,1024,16)                       ← 32×32 = 1024 spatial tokens
+    │
+    ▼ Spatial Pooling (avg_pool 8×8)
+  Pooled Latents (B,5,16,16)          ← 4×4 = 16 tokens, dim=16
+    │
+    ▼ Dynamics Model (TRAINABLE)
+    │
+    ▼ Shortcut Forcing Loss (predict future latents)
+
+══════════════════════════════════════════════════════════════════════════════
+
+
+PHASE 2: Agent Finetuning (Behavior Cloning)
+══════════════════════════════════════════════════════════════════════════════
+
+  Video → Tokenizer (FROZEN) → Latents (B,5,16,16)
+    │
+    ▼ Flatten
+  (B,5,256)                           ← 16 tokens × 16 dim = 256
+    │
+    ├──► Policy Head (TRAINABLE)      → BC loss (predict actions)
+    │
+    └──► Reward Head (TRAINABLE)      → Symlog cross-entropy (predict rewards)
+
+  Dynamics: FROZEN
+  Value Head: initialized (not primary focus)
+
+  [Optional for multi-task: inject TASK_TOKEN at sequence start]
+
+══════════════════════════════════════════════════════════════════════════════
+
+
+PHASE 3: PMPO Imagination RL
+══════════════════════════════════════════════════════════════════════════════
+
+  Real Frame → Tokenizer (FROZEN) → Initial Latent z₀
+    │
+    ▼ Imagination Rollout (H steps)
+    ┌─────────────────────────────────────────────────────────┐
+    │  for t in range(H):                                     │
+    │      zₜ  ──► Policy Head (TRAINABLE) ──► aₜ            │
+    │      (zₜ, aₜ) ──► Dynamics (FROZEN) ──► zₜ₊₁           │
+    │      zₜ  ──► Reward Head (FROZEN) ──► r̂ₜ               │
+    └─────────────────────────────────────────────────────────┘
+    │
+    ▼ Compute Advantages
+  Âₜ = sign(GAE returns)              ← Binarized for PMPO
+    │
+    ├──► Policy: PMPO loss            -(Âₜ · log π(aₜ|zₜ))
+    │
+    └──► Value Head: TD(λ) loss       (TRAINABLE)
+
+  ⚠️  IMPORTANT: No gradients flow through world model!
+      Only policy & value heads receive gradients.
+      Reward head predictions come from Phase 2 (frozen).
+
+══════════════════════════════════════════════════════════════════════════════
 ```
 
 ### Summary Table
@@ -117,7 +150,8 @@ def preprocess_batch(frames_64):  # frames_64: [B, T, C, 64, 64] or [B, C, T, 64
 
 | Check | How | Red Flags |
 |-------|-----|-----------|
-| **Tokenizer output** | Log `latents.shape`, `latents.mean()`, `latents.std()` | Shape not `(B,4,16,16)`, std=0 or NaN |
+| **Tokenizer output** | Log `latents.shape`, `latents.mean()`, `latents.std()` | Shape not `(B,5,16,16)`, std=0 or NaN |
+| **Temporal dim** | Verify `T_lat = 1 + ceil((T-1)/8)` | Wrong T_lat = non-causal encoder or bug |
 | **Reconstruction** | Decode latents → save images periodically | Blurry/wrong colors = pooling too aggressive |
 | **Dynamics loss curve** | TensorBoard `loss/dynamics/total` | Flat line = not learning; spikes = LR too high |
 | **Gradient norms** | Log `torch.nn.utils.clip_grad_norm_()` return value | >100 = exploding; <1e-6 = vanishing |
@@ -128,7 +162,10 @@ def preprocess_batch(frames_64):  # frames_64: [B, T, C, 64, 64] or [B, C, T, 64
 # Quick sanity check for Phase 1
 with torch.no_grad():
     out = cosmos_tokenizer.encode(frames)
-    print(f"Latent shape: {out['latents'].shape}")  # Expect (B, 4, 16, 16)
+    T_frames = frames.shape[2]  # or frames.shape[1] depending on format
+    T_lat_expected = 1 + math.ceil((T_frames - 1) / 8)
+    print(f"Latent shape: {out['latents'].shape}")  # Expect (B, T_lat_expected, 16, 16)
+    print(f"Expected T_lat: {T_lat_expected}, Got: {out['latents'].shape[1]}")
     print(f"Latent stats: mean={out['latents'].mean():.3f}, std={out['latents'].std():.3f}")
 ```
 
@@ -165,6 +202,7 @@ with torch.no_grad():
 | **Policy entropy** | Log entropy from PMPO loss | <0.1 = premature convergence |
 | **D+/D- samples** | Log `n_positive`, `n_negative` from PMPO | Both <10 = degenerate binning |
 | **Imagination drift** | Visualize decoded latents at horizon H | Garbage = dynamics diverging |
+| **Gradient flow** | Verify no grads on tokenizer/dynamics/reward | Grads present = freezing failed |
 
 ```python
 # Check imagination rollout sanity
@@ -172,6 +210,11 @@ rollout = imagination(initial_latents, lambda_=0.95)
 print(f"Rewards: mean={rollout['rewards'].mean():.4f}, std={rollout['rewards'].std():.4f}")
 print(f"Advantages: mean={rollout['advantages'].mean():.4f}, std={rollout['advantages'].std():.4f}")
 print(f"Non-zero rewards: {(rollout['rewards'] != 0).float().mean():.2%}")
+
+# Verify no gradients through world model
+print(f"Tokenizer grads: {any(p.grad is not None for p in tokenizer.parameters())}")  # Should be False
+print(f"Dynamics grads: {any(p.grad is not None for p in dynamics.parameters())}")    # Should be False
+print(f"Reward head grads: {any(p.grad is not None for p in reward_head.parameters())}")  # Should be False
 ```
 
 ---
@@ -185,12 +228,15 @@ print(f"Non-zero rewards: {(rollout['rewards'] != 0).float().mean():.2%}")
 | OOM | Batch too large, no gradient accumulation | Reduce batch, enable accumulation |
 | Slow training | DataLoader bottleneck | Increase `num_workers`, enable `pin_memory` |
 | Checkpoint won't load | `torch.compile()` prefix mismatch | Use `strip_compiled_prefix()` |
+| Wrong T_lat dimension | Non-causal assumption | Use `1 + ceil((T-1)/8)` formula |
 
 ---
 
 ### Quick Diagnostic Script
 
 ```python
+import math
+
 def diagnose_phase(phase, model_dict, sample_batch, device):
     """Run diagnostics for any phase."""
     print(f"=== Phase {phase} Diagnostics ===")
@@ -206,7 +252,14 @@ def diagnose_phase(phase, model_dict, sample_batch, device):
         with torch.no_grad():
             frames = sample_batch["frames"].to(device)
             latents = model_dict["tokenizer"].encode(frames)["latents"]
+
+            # Check temporal dimension (causal formula)
+            T_frames = frames.shape[2] if frames.shape[1] == 3 else frames.shape[1]
+            T_lat_expected = 1 + math.ceil((T_frames - 1) / 8)
+            T_lat_actual = latents.shape[1]
+
             print(f"Tokenizer output: {latents.shape}, finite={latents.isfinite().all()}")
+            print(f"Temporal: {T_frames} frames → {T_lat_actual} latents (expected {T_lat_expected})")
     except Exception as e:
         print(f"Forward pass failed: {e}")
 

@@ -16,8 +16,11 @@ cosmos_tokenizer:
   checkpoint_path: "cosmos_tokenizer/CV8x8x8"
   model_variant: "CV8x8x8"
   dtype: "bfloat16"
-  input_resolution: 256    # Upsample MineRL 64x64 -> 256x256 for Cosmos
-  pool_tokens: 16          # Pool 1024 native tokens -> 16 (critical for 12GB VRAM)
+  # Native 64×64 input (no upsampling!) - best quality
+  # 64×64 → Cosmos → 8×8 = 64 tokens (no pooling = no spatial loss)
+  input_resolution: 64     # Native MineRL resolution
+  pool_tokens: null        # No pooling - keep all 64 tokens (best quality)
+  # Set pool_tokens: 16 for 4× pooling if memory constrained
 
 # Data settings
 data:
@@ -31,13 +34,13 @@ data:
   frame_skip: 1
   resize_to: null
 
-# Tokenizer output settings (after Cosmos encoding + pooling)
+# Tokenizer output settings (after Cosmos encoding)
 # These are used by heads and dynamics model
 tokenizer:
-  # Output dimensions from Cosmos wrapper (after spatial pooling)
-  num_latent_tokens: 16    # After pooling (native would be 1024)
+  # Output dimensions from Cosmos wrapper (no pooling)
+  num_latent_tokens: 64    # 8×8 = 64 tokens (native, no pooling)
   latent_dim: 16           # Cosmos latent channel dimension
-  # Flattened: 16 * 16 = 256 (for head input)
+  # Flattened: 64 * 16 = 1024 (for head input)
 
   # Legacy fields (only used if cosmos_tokenizer.enabled = false)
   patch_size: 8
@@ -50,7 +53,7 @@ tokenizer:
 
 # Dynamics model settings
 dynamics:
-  # Adjusted for 256-dim latent input (16 tokens * 16 dim)
+  # Adjusted for 1024-dim latent input (64 tokens * 16 dim)
   embed_dim: 256           # Internal transformer dimension
   num_layers: 12           # Reduced from paper's 32 for memory
   num_heads: 8
@@ -63,10 +66,9 @@ dynamics:
 
 # Agent heads settings
 heads:
-  # IMPORTANT: Input dimension is now 256 (16 tokens * 16 dim)
-  # Previously was 512 (16 tokens * 32 dim) with original tokenizer
-  input_dim: 256           # 16 * 16 = 256
-  hidden_dim: 256
+  # Input dimension: 64 tokens × 16 dim = 1024 (no pooling)
+  input_dim: 1024          # 64 * 16 = 1024
+  hidden_dim: 512          # Increased for larger input
   num_layers: 2
   num_bins: 255
   num_actions: 144
@@ -155,12 +157,13 @@ logging:
 
 # Memory optimization for RTX 3060 (12GB)
 memory:
-  # Expected VRAM usage:
+  # Expected VRAM usage (native 64×64, no pooling):
   # - Cosmos encoder (frozen, bf16): ~2 GB
   # - Dynamics model (trainable): ~4 GB
-  # - Activations (batch=4, seq=32): ~2 GB
-  # - Optimizer states: ~1 GB
-  # - Total: ~9 GB (leaves headroom)
+  # - Activations (batch=4, seq=32, 64 tokens): ~3 GB
+  # - Optimizer states: ~1.5 GB
+  # - Total: ~10.5 GB (tight but should fit)
+  # If OOM: set pool_tokens: 16 or reduce batch_size
 
   gradient_checkpointing: false  # Enable if OOM
   empty_cache_frequency: 100     # Clear cache every N steps

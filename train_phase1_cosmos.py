@@ -128,11 +128,13 @@ def train_dynamics_step(
     if discrete_actions and actions.dim() == 3:
         actions = actions.squeeze(-1)
 
-    # Adjust actions to match latent time dimension (T/8 due to temporal compression)
+    # Adjust actions to match latent time dimension
+    # Cosmos CV8x8x8 is CAUSAL: T_lat = 1 + ceil((T - 1) / 8)
+    # Example: 32 frames → 5 latent steps (not 4!)
     T_lat = latents.shape[1]
     if actions.shape[1] > T_lat:
         # Subsample actions to match latent time steps
-        # Take every 8th action (matching temporal compression)
+        # Use linspace to evenly sample actions across the sequence
         action_indices = torch.linspace(0, actions.shape[1] - 1, T_lat).long()
         actions = actions[:, action_indices]
 

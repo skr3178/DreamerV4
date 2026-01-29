@@ -41,3 +41,13 @@ It did learn to predict pixels with epoch 9.
 ![V4](videos/phase1_latest_comparisons/reconstruction_4.gif)
 
 ![V5](videos/phase1_latest_comparisons/reconstruction_5.gif)
+
+
+Dreamer 4 absorbs the majority of its knowledge from unlabeled videos, and requires only a small amount of videos paired with actions.
+
+MineRL is fully labeled (every frame has expert actions). You're wasting compute feeding high-entropy action embeddings when the model needs unlabeled diversity to learn physics. The 2B parameters will overfit to the 759 trajectories instead of learning generalizable world simulation.
+
+The paper uses 360×640 (VPT) or at least 128×128 (DMControl). At 64×64:
+Inventory/crafting UI is illegible (critical for diamonds)
+Block textures blur together (diamond ore vs stone)
+Mouse cursor is invisible (needed for action grounding)
